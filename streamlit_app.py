@@ -10,14 +10,13 @@ from concurrent.futures import ThreadPoolExecutor
 # =========================
 st.set_page_config(page_title="Crypto Sniper Pro V5", layout="wide", page_icon="🎯")
 
-st.markdown("""
+st.markdown(
+    """
 <style>
-    /* Глобальні стилі */
     .stApp { background-color: #0e1117; }
     .stDataFrame { font-size: 14px; }
     div[data-testid="stMetricValue"] { font-size: 16px !important; }
-    
-    /* Картка сигналу */
+
     .mobile-card {
         background-color: #1a1c24;
         border: 1px solid #2b2d35;
@@ -26,10 +25,10 @@ st.markdown("""
         margin-bottom: 12px;
         box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
-    .card-header { 
-        display: flex; 
-        justify-content: space-between; 
-        align-items: center; 
+    .card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
         margin-bottom: 12px;
         border-bottom: 1px solid #2b2d35;
         padding-bottom: 8px;
@@ -38,223 +37,329 @@ st.markdown("""
     .signal-badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.9em; }
     .badge-long { background-color: #1e3a2f; color: #00ff00; border: 1px solid #00ff00; }
     .badge-short { background-color: #3a1e1e; color: #ff4b4b; border: 1px solid #ff4b4b; }
-    
-    /* Рядки даних */
+
     .data-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 0.95em; }
     .label { color: #8b92a6; }
     .value { color: #e0e0e0; font-weight: 500; font-family: 'Roboto Mono', monospace; }
-    
-    /* Текст тренду */
+
     .trend-info { margin-top: 10px; font-size: 0.85em; color: #8b92a6; font-style: italic; }
     .warning { color: #ffa726; font-weight: bold; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 st.title("🎯 Multi-Exchange Sniper Pro V5")
-st.markdown("RSI + Trend Scanner: **Binance, Bybit, KuCoin, OKX, Kraken**")
+st.markdown("RSI + Trend Scanner: **Binance, Bybit, KuCoin Futures, OKX, Kraken Futures**")
 
 # =========================
 # 2. CORE UTILS
 # =========================
 def fmt_price(price):
-    if not isinstance(price, (int, float)): return "N/A"
-    if price >= 1000: return f"{price:.1f}"
-    if price >= 10: return f"{price:.2f}"
-    if price >= 0.1: return f"{price:.4f}"
-    return f"{price:.8f}".rstrip('0').rstrip('.')
+    if not isinstance(price, (int, float, np.floating)) or pd.isna(price):
+        return "N/A"
+    price = float(price)
+    if price >= 1000:
+        return f"{price:.1f}"
+    if price >= 10:
+        return f"{price:.2f}"
+    if price >= 0.1:
+        return f"{price:.4f}"
+    return f"{price:.8f}".rstrip("0").rstrip(".")
+
+
+def normalize_manual_item(x: str) -> tuple[str, str]:
+    """Приймає 'BTC/USDT', 'BTCUSDT', 'btc/usdt' і т.п. Повертає (base, quote)."""
+    x = (x or "").strip().upper().replace(" ", "")
+    if not x:
+        return ("", "")
+
+    if "/" in x:
+        base, quote = x.split("/", 1)
+        return base, quote
+
+    # евристика: BTCUSDT -> BTC/USDT
+    if x.endswith("USDT"):
+        return x[:-4], "USDT"
+    if x.endswith("USD"):
+        return x[:-3], "USD"
+
+    # якщо незрозуміло — вважаємо USDT
+    return x, "USDT"
+
 
 # =========================
 # 3. DATA ENGINE
 # =========================
+# ✅ Важливо: KuCoin та Kraken futures мають окремі класи в CCXT
 EXCHANGE_CLASSES = {
-    'binance': ccxt.binance,
-    'bybit': ccxt.bybit,
-    'kucoin': ccxt.kucoin,
-    'okx': ccxt.okx,
-    'kraken': ccxt.kraken,
+    "binance": ccxt.binance,
+    "bybit": ccxt.bybit,
+    "kucoin": ccxt.kucoinfutures,
+    "okx": ccxt.okx,
+    "kraken": ccxt.krakenfutures,
 }
+
+SUPPORTED_EXCHANGES = list(EXCHANGE_CLASSES.keys())
+
 
 @st.cache_resource
 def get_exchange_config(exchange_id: str):
-    """Повертає базову конфігурацію для біржі (без створення важкого об'єкта)"""
-    config = {
-        "enableRateLimit": True,
-        "options": {"defaultType": "future"},
-    }
-    if exchange_id == 'okx':
+    """
+    Базова конфігурація. Не створюємо тут інстанс біржі.
+    defaultType відрізняється між біржами.
+    """
+    config = {"enableRateLimit": True, "options": {}}
+
+    # практично корисні дефолти для деривативів
+    if exchange_id == "binance":
+        config["options"]["defaultType"] = "future"  # USDⓈ-M futures
+    elif exchange_id == "bybit":
+        config["options"]["defaultType"] = "swap"    # perp
+    elif exchange_id == "kucoin":
+        config["options"]["defaultType"] = "swap"    # kucoin futures = swap/perp в ccxt
+    elif exchange_id == "okx":
+        config["options"]["defaultType"] = "swap"    # OKX swap
+    elif exchange_id == "kraken":
+        config["options"]["defaultType"] = "future"  # Kraken Futures
+    else:
         config["options"]["defaultType"] = "swap"
-    elif exchange_id == 'kraken':
-        config["options"]["defaultType"] = "future" 
-    
+
     return config
+
+
+def is_target_derivative_market(exchange_id: str, m: dict) -> bool:
+    """
+    Надійний фільтр деривативів:
+    - active
+    - contract (swap/future)
+    - quote (USDT для більшості; для Kraken часто USD)
+    - для USDT-маржинальних бірж: linear True
+    """
+    if not m or not m.get("active"):
+        return False
+
+    allowed_quotes = {"USDT"} if exchange_id != "kraken" else {"USD", "USDT"}
+    if m.get("quote") not in allowed_quotes:
+        return False
+
+    # contract=True відділяє деривативи від spot
+    if not m.get("contract"):
+        return False
+
+    # маємо бути swap або future
+    if not (m.get("swap") or m.get("future")):
+        return False
+
+    # Для більшості “USDT perpetual” хочемо linear (USDT-margined)
+    # Kraken futures може мати інші поля/структуру — не душимо.
+    if exchange_id != "kraken":
+        if not m.get("linear", False):
+            return False
+
+    return True
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_market_data(exchange_id: str, scan_mode: str, top_n: int, manual_list: list):
-    """Отримує список монет і їх 24h зміни"""
+    """
+    Отримує список символів та 24h%:
+    - Auto: беремо всі деривативи, ранжуємо по об’єму, обрізаємо топ-N
+    - Manual: матчимо по base/quote, але повертаємо реальні symbol біржі
+    """
     config = get_exchange_config(exchange_id)
     ExClass = EXCHANGE_CLASSES.get(exchange_id)
-    if not ExClass: return [], {}
-    
-    # Тимчасовий інстанс для отримання тікерів
+    if not ExClass:
+        return [], {}
+
     ex = ExClass(config)
-    
+
     try:
         markets = ex.load_markets()
-        target_symbols = []
 
-        # 1. Визначаємо пул монет (всі активні ф'ючерси)
+        # --- 1) Формуємо пул символів
         if scan_mode.startswith("Auto"):
-            for s, m in markets.items():
-                if not m.get('active') or m.get('quote') != 'USDT': continue
-                
-                # Фільтрація по біржах
-                is_target = False
-                if exchange_id == 'binance' and m.get('linear') and m.get('swap'): is_target = True
-                elif exchange_id == 'bybit' and m.get('linear') and 'PERP' in s: is_target = True
-                elif exchange_id == 'kucoin' and m.get('type') == 'future': is_target = True
-                elif exchange_id == 'okx' and m.get('swap') and m.get('linear'): is_target = True
-                elif exchange_id == 'kraken' and m.get('linear'): is_target = True # Kraken linear futures
-
-                if is_target:
-                    target_symbols.append(s)
+            target_symbols = [s for s, m in markets.items() if is_target_derivative_market(exchange_id, m)]
         else:
-            # Ручний режим: перевіряємо, чи існують введені монети на біржі
-            target_symbols = [s for s in manual_list if s in markets]
+            wanted = []
+            for it in manual_list:
+                base, quote = normalize_manual_item(it)
+                if base and quote:
+                    wanted.append((base, quote))
 
+            target_symbols = []
+            for base, quote in wanted:
+                found = None
+                for s, m in markets.items():
+                    if not is_target_derivative_market(exchange_id, m):
+                        continue
+                    if (m.get("base") == base) and (m.get("quote") == quote):
+                        found = s
+                        break
+                if found:
+                    target_symbols.append(found)
+
+        # прибираємо дублікати
+        target_symbols = list(dict.fromkeys(target_symbols))
         if not target_symbols:
             return [], {}
 
-        # 2. Отримуємо дані (ціна, об'єм, зміна)
-        # Беремо топ-N за об'ємом або всі для ручного режиму
-        limit = top_n if scan_mode.startswith("Auto") else len(target_symbols)
-        
-        # Щоб не перевантажити API, fetch_tickers іноді краще брати пакетами, 
-        # але тут спростимо:
-        if len(target_symbols) > 100 and scan_mode.startswith("Auto"):
-             # Це "брудна" евристика, але fetch_tickers без аргументів повертає все, що часто швидше ніж список
-             tickers = ex.fetch_tickers()
-             # Фільтруємо отримане
-             tickers = {k: v for k, v in tickers.items() if k in target_symbols}
-        else:
-             tickers = ex.fetch_tickers(target_symbols)
+        # --- 2) Тікери: пробуємо fetch_tickers(list), якщо падає — беремо всі і фільтруємо
+        try:
+            tickers = ex.fetch_tickers(target_symbols)
+        except Exception:
+            tickers_all = ex.fetch_tickers()
+            tickers = {k: v for k, v in tickers_all.items() if k in target_symbols}
 
         scored = []
-        for s, t in tickers.items():
-            if s not in target_symbols: continue
-            vol = t.get('quoteVolume', 0) or t.get('volume', 0) or 0
-            change = t.get('percentage', 0) or 0
-            scored.append((s, vol, change))
+        for s in target_symbols:
+            t = tickers.get(s) or {}
+            vol = t.get("quoteVolume") or t.get("baseVolume") or t.get("volume") or 0
+            chg = t.get("percentage") or 0
 
-        # Сортуємо за об'ємом
+            try:
+                vol = float(vol) if vol else 0.0
+            except Exception:
+                vol = 0.0
+
+            try:
+                chg = float(chg) if chg is not None else 0.0
+            except Exception:
+                chg = 0.0
+
+            scored.append((s, vol, chg))
+
         scored.sort(key=lambda x: x[1], reverse=True)
-        
-        # Обрізаємо до ліміту
-        final_list = scored[:limit]
-        
-        coins = [x[0] for x in final_list]
-        changes = {x[0]: x[2] for x in final_list}
-        
+        final = scored[: (top_n if scan_mode.startswith("Auto") else len(scored))]
+
+        coins = [x[0] for x in final]
+        changes = {x[0]: x[2] for x in final}
         return coins, changes
 
     except Exception as e:
         st.error(f"API Error ({exchange_id}): {e}")
         return [], {}
 
+
 def fetch_candle_data(args):
-    """Потокова функція завантаження свічок"""
+    """Потокове завантаження OHLCV"""
     symbol, tf, limit, exchange_id, config = args
     ExClass = EXCHANGE_CLASSES.get(exchange_id)
+    if not ExClass:
+        return symbol, None, "Unknown exchange class"
+
     ex = ExClass(config)
-    
+
     try:
-        # Невелика пауза для запобігання rate-limit в потоках
-        time.sleep(0.1) 
-        
-        # OKX вимагає ініціалізації ринків для коректного парсингу
-        if exchange_id == 'okx': ex.load_markets()
-            
+        time.sleep(0.1)  # м’яка пауза проти rate-limit у потоках
+
+        # OKX іноді потребує load_markets для коректного парсингу символа
+        if exchange_id == "okx":
+            ex.load_markets()
+
         ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-        if not ohlcv: return symbol, None, "Empty Data"
-        
+        if not ohlcv:
+            return symbol, None, "Empty Data"
+
         df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         return symbol, df, None
     except Exception as e:
         return symbol, None, str(e)
 
+
 # =========================
 # 4. ANALYSIS LOGIC
 # =========================
-def analyze_market(df, rsi_len, ema_len, os_level, ob_level):
-    if df is None or len(df) < ema_len: return None
+def analyze_market(df: pd.DataFrame, rsi_len: int, ema_len: int, os_level: float, ob_level: float):
+    if df is None or len(df) < max(ema_len, rsi_len, 20):
+        return None
 
-    # RSI Calculation
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/rsi_len, adjust=False).mean()
-    loss = (-delta).clip(lower=0).ewm(alpha=1/rsi_len, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
 
-    # ATR Calculation (Simple)
-    high_low = df["high"] - df["low"]
-    df["atr"] = high_low.ewm(span=14, adjust=False).mean()
+    # RSI (Wilder-like via ewm)
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / rsi_len, adjust=False).mean()
+    loss = (-delta).clip(lower=0).ewm(alpha=1 / rsi_len, adjust=False).mean()
+
+    # якщо loss==0 -> RSI=100; якщо gain==0 -> RSI=0
+    rs = pd.Series(np.where(loss.values == 0, np.inf, (gain / loss).values), index=df.index)
+    rsi = 100 - (100 / (1 + rs))
+    df["rsi"] = rsi
+
+    # ATR (True Range, ewm)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    df["atr"] = tr.ewm(span=14, adjust=False).mean()
 
     # Trend EMA
-    df["ema"] = df["close"].ewm(span=ema_len, adjust=False).mean()
+    df["ema"] = close.ewm(span=ema_len, adjust=False).mean()
 
     last = df.iloc[-1]
-    
-    # Signals
+    if pd.isna(last["rsi"]) or pd.isna(last["ema"]) or pd.isna(last["atr"]):
+        return None
+
     sig = None
-    if last["rsi"] < os_level: sig = "LONG"
-    elif last["rsi"] > ob_level: sig = "SHORT"
+    if last["rsi"] < os_level:
+        sig = "LONG"
+    elif last["rsi"] > ob_level:
+        sig = "SHORT"
 
-    # Trend Status
     trend = "NEUTRAL"
-    if last["close"] > last["ema"]: trend = "BULLISH 🟢"
-    elif last["close"] < last["ema"]: trend = "BEARISH 🔴"
+    if last["close"] > last["ema"]:
+        trend = "BULLISH 🟢"
+    elif last["close"] < last["ema"]:
+        trend = "BEARISH 🔴"
 
-    # Warning
     warn = ""
     if (sig == "LONG" and "BEARISH" in trend) or (sig == "SHORT" and "BULLISH" in trend):
         warn = "⚠️ Counter-Trend"
 
     return {
-        "price": last["close"],
-        "rsi": last["rsi"],
-        "atr": last["atr"],
+        "price": float(last["close"]),
+        "rsi": float(last["rsi"]),
+        "atr": float(last["atr"]),
         "trend": trend,
         "signal": sig,
-        "warning": warn
+        "warning": warn,
     }
+
 
 def create_telegram_post(coin, data, params, exchange_id):
     side = data["signal"]
     price = data["price"]
     atr = data["atr"]
-    
-    # Unpack params
-    lev = params['lev']
-    offset = params['offset']
-    sl_mult = params['sl']
-    tps = params['tps'] # list of multipliers
-    
+
+    lev = params["lev"]
+    offset = params["offset"]
+    sl_mult = params["sl"]
+    tps = params["tps"]
+
     emoji = "🟢" if side == "LONG" else "🔴"
-    
-    # Logic: Limit Entry
+
+    # Limit entry
     limit_price = price * (1 - offset) if side == "LONG" else price * (1 + offset)
-    
-    # Logic: SL & TP based on Entry
+
+    # SL/TP from limit
     if side == "LONG":
         sl_price = limit_price - (atr * sl_mult)
         tp_prices = [limit_price + (atr * m) for m in tps]
     else:
         sl_price = limit_price + (atr * sl_mult)
         tp_prices = [limit_price - (atr * m) for m in tps]
-        
+
     risk = abs(limit_price - sl_price)
     reward = abs(limit_price - tp_prices[-1])
-    rr = reward / risk if risk else 0
+    rr = reward / risk if risk else 0.0
 
     txt = f"#{coin.split('/')[0]} {emoji} {side} SETUP\n"
     txt += f"🏦 Ex: {exchange_id.upper()} | Lev: x{lev[0]}-{lev[1]}\n"
@@ -265,8 +370,9 @@ def create_telegram_post(coin, data, params, exchange_id):
         txt += f"💰 TP{i+1}: {fmt_price(tp)}\n"
     txt += "------------------\n"
     txt += f"⚖️ RR: 1:{rr:.1f} | Market: {fmt_price(price)}"
-    
+
     return txt
+
 
 # =========================
 # 5. UI SIDEBAR
@@ -274,17 +380,17 @@ def create_telegram_post(coin, data, params, exchange_id):
 st.sidebar.header("🛠️ Налаштування")
 
 with st.sidebar.expander("🌐 Біржа та Активи", expanded=True):
-    exch = st.selectbox("Біржа", ["binance", "bybit", "kucoin", "okx", "kraken"], format_func=str.upper)
+    exch = st.selectbox("Біржа", SUPPORTED_EXCHANGES, format_func=str.upper)
     mode = st.radio("Режим пошуку", ["Auto (Top Volume)", "Manual List"])
-    
+
     if "Auto" in mode:
-        n_coins = st.slider("Кількість монет", 10, 100, 30)
+        n_coins = st.slider("Кількість монет", 10, 150, 30)
         manual_coins = []
     else:
         n_coins = 0
         default_list = "BTC/USDT, ETH/USDT, SOL/USDT, BNB/USDT, DOGE/USDT, XRP/USDT, LTC/USDT"
         raw_manual = st.text_area("Список монет (через кому)", default_list)
-        manual_coins = [x.strip().upper() for x in raw_manual.split(",")]
+        manual_coins = [x.strip() for x in raw_manual.split(",") if x.strip()]
 
 with st.sidebar.expander("📊 Стратегія", expanded=False):
     tf = st.selectbox("Timeframe", ["5m", "15m", "1h", "4h"], index=1)
@@ -297,7 +403,7 @@ with st.sidebar.expander("💰 Ризик-менеджмент (для пост�
     p_lev = st.slider("Leverage", 1, 50, (10, 20))
     p_off = st.slider("Entry Offset (%)", 0.0, 5.0, 0.5, step=0.1) / 100
     p_sl = st.slider("Stop Loss (xATR)", 1.0, 5.0, 2.0)
-    p_tps = [1.0, 2.5, 4.0] # Multipliers for TP1, TP2, TP3
+    p_tps = [1.0, 2.5, 4.0]
 
 # =========================
 # 6. MAIN APP
@@ -307,88 +413,95 @@ c1.subheader(f"📡 Сканер: {exch.upper()} [{tf}]")
 run = c2.button("🚀 ЗАПУСТИТИ СКАНЕР", type="primary", use_container_width=True)
 
 if run:
-    # 1. Fetch Symbols
     with st.spinner("Отримання ринкових даних..."):
-        # Очистка кешу даних ринку при новому запуску для актуальності
+        # важливо: чистимо саме cache_data, щоб взяти свіжий топ/список
         get_market_data.clear()
         coins, changes_dict = get_market_data(exch, mode, n_coins, manual_coins)
-    
+
     if not coins:
-        st.error("Не знайдено монет. Перевірте список або налаштування.")
+        st.error("Не знайдено монет. Перевірте список або налаштування (особливо Manual).")
         st.stop()
-        
-    # 2. Scanning
+
     progress = st.progress(0)
     status_text = st.empty()
-    
+
     results = []
-    
-    # Threading Config
+
     ex_conf = get_exchange_config(exch)
-    tasks = [(c, tf, ema_len + 50, exch, ex_conf) for c in coins]
-    
-    # Зменшуємо кількість воркерів для стабільності на Cloud
-    MAX_WORKERS = 5 
-    
+    candle_limit = max(ema_len + 50, 250)  # запас під EMA/RSI/ATR
+    tasks = [(c, tf, candle_limit, exch, ex_conf) for c in coins]
+
+    MAX_WORKERS = 5
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         completed = 0
         total = len(coins)
-        
+
         for symbol, df, err in executor.map(fetch_candle_data, tasks):
             completed += 1
             progress.progress(completed / total)
             status_text.caption(f"Аналіз: {symbol} ({completed}/{total})")
-            
+
             if err:
                 continue
-                
+
             analysis = analyze_market(df, rsi_len, ema_len, os, ob)
-            if not analysis: continue
-            
-            # Post Gen
+            if not analysis:
+                continue
+
             post_txt = ""
-            if analysis["signal"]:
-                post_params = {'lev': p_lev, 'offset': p_off, 'sl': p_sl, 'tps': p_tps}
+            if analysis["signal"] in ("LONG", "SHORT"):
+                post_params = {"lev": p_lev, "offset": p_off, "sl": p_sl, "tps": p_tps}
                 post_txt = create_telegram_post(symbol, analysis, post_params, exch)
 
-            results.append({
-                "Coin": symbol,
-                "Price": analysis["price"],
-                "24h%": changes_dict.get(symbol, 0),
-                "RSI": analysis["rsi"],
-                "Signal": analysis["signal"],
-                "Trend": analysis["trend"],
-                "Warning": analysis["warning"],
-                "Post": post_txt
-            })
-            
+            results.append(
+                {
+                    "Coin": symbol,
+                    "Price": analysis["price"],
+                    "24h%": float(changes_dict.get(symbol, 0) or 0),
+                    "RSI": analysis["rsi"],
+                    "Signal": analysis["signal"],
+                    "Trend": analysis["trend"],
+                    "Warning": analysis["warning"],
+                    "Post": post_txt,
+                }
+            )
+
     progress.empty()
     status_text.empty()
-    
-    # 3. Visualization
+
     df_res = pd.DataFrame(results)
-    
+
     if df_res.empty:
-        st.warning("Дані не отримано.")
-    else:
-        # Sorting
-        df_res["_sort_sig"] = df_res["Signal"].apply(lambda x: 0 if x else 1)
-        df_res["_sort_rsi"] = df_res.apply(lambda r: r["RSI"] if r["Signal"]=="LONG" else (100-r["RSI"] if r["Signal"]=="SHORT" else 50), axis=1)
-        df_res = df_res.sort_values(by=["_sort_sig", "_sort_rsi"])
-        
-        tab_sig, tab_all = st.tabs(["📱 Сигнали", "📋 Всі Результати"])
-        
-        # --- MOBILE VIEW ---
-        with tab_sig:
-            signals = df_res[df_res["Signal"].notna()]
-            if signals.empty:
-                st.info("🟢 Немає активних сигналів за вказаними параметрами.")
-            else:
-                for _, row in signals.iterrows():
-                    sig_class = "badge-long" if row["Signal"] == "LONG" else "badge-short"
-                    warn_html = f'<span class="warning">{row["Warning"]}</span>' if row["Warning"] else ""
-                    
-                    st.markdown(f"""
+        st.warning("Дані не отримано (або все відвалилось на API/rate-limit).")
+        st.stop()
+
+    # =========================
+    # Sorting (✅ фікс NaN/None)
+    # =========================
+    df_res["_sort_sig"] = df_res["Signal"].apply(lambda x: 1 if pd.isna(x) else 0)
+    df_res["_sort_rsi"] = df_res.apply(
+        lambda r: r["RSI"]
+        if r["Signal"] == "LONG"
+        else (100 - r["RSI"] if r["Signal"] == "SHORT" else 50),
+        axis=1,
+    )
+    df_res = df_res.sort_values(by=["_sort_sig", "_sort_rsi"], ascending=[True, True])
+
+    tab_sig, tab_all = st.tabs(["📱 Сигнали", "📋 Всі Результати"])
+
+    # --- MOBILE VIEW ---
+    with tab_sig:
+        signals = df_res[df_res["Signal"].isin(["LONG", "SHORT"])]
+        if signals.empty:
+            st.info("🟢 Немає активних сигналів за вказаними параметрами.")
+        else:
+            for _, row in signals.iterrows():
+                sig_class = "badge-long" if row["Signal"] == "LONG" else "badge-short"
+                warn_html = f'<span class="warning">{row["Warning"]}</span>' if row["Warning"] else ""
+
+                st.markdown(
+                    f"""
                     <div class="mobile-card">
                         <div class="card-header">
                             <span class="coin-title">{row['Coin']}</span>
@@ -406,22 +519,25 @@ if run:
                             Trend: {row['Trend']} &nbsp; {warn_html}
                         </div>
                     </div>
-                    """, unsafe_allow_html=True)
-                    
-                    with st.expander("📋 Копіювати сигнал"):
-                        st.code(row["Post"], language="text")
-        
-        # --- DESKTOP TABLE ---
-        with tab_all:
-            # Форматуємо для Data Editor
-            st.data_editor(
-                df_res[["Coin", "Price", "24h%", "RSI", "Signal", "Trend", "Warning"]],
-                column_config={
-                    "RSI": st.column_config.ProgressColumn("RSI", min_value=0, max_value=100, format="%.1f"),
-                    "Price": st.column_config.NumberColumn(format="%.4f"),
-                    "24h%": st.column_config.NumberColumn(format="%.2f%%"),
-                },
-                use_container_width=True,
-                height=600,
-                hide_index=True
-            )
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                with st.expander("📋 Копіювати сигнал"):
+                    st.code(row["Post"], language="text")
+
+    # --- DESKTOP TABLE ---
+    with tab_all:
+        view = df_res[["Coin", "Price", "24h%", "RSI", "Signal", "Trend", "Warning"]].copy()
+
+        st.data_editor(
+            view,
+            column_config={
+                "RSI": st.column_config.ProgressColumn("RSI", min_value=0, max_value=100, format="%.1f"),
+                "Price": st.column_config.NumberColumn(format="%.8f"),
+                "24h%": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+            use_container_width=True,
+            height=600,
+            hide_index=True,
+        )
