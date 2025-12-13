@@ -3,22 +3,17 @@ import ccxt
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from concurrent.futures import ThreadPoolExecutor
 
 # =========================
-# 1. CONFIG & STYLES (MOBILE OPTIMIZED)
+# 1. CONFIG & STYLES
 # =========================
-st.set_page_config(page_title="Crypto Sniper Pro V2", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="Bybit Sniper Pro", layout="wide", page_icon="⚡")
 
-# Custom CSS: Mobile-friendly cards and metrics
 st.markdown("""
 <style>
-    /* Global Text Sizing */
     .stDataFrame {font-size: 14px;}
     div[data-testid="stMetricValue"] {font-size: 16px !important;}
-    
-    /* Mobile Card Style */
     .mobile-card {
         background-color: #262730;
         border: 1px solid #464b5f;
@@ -29,52 +24,55 @@ st.markdown("""
     .signal-long { color: #00ff00; font-weight: bold; }
     .signal-short { color: #ff4b4b; font-weight: bold; }
     .card-header { display: flex; justify-content: space-between; align-items: center; }
-    
-    /* Button Optimization */
     .stButton button { width: 100%; border-radius: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ Crypto Sniper Pro V2: Mobile Edition")
+st.title("⚡ Bybit Sniper Pro: Mobile Edition")
 
 # =========================
-# 2. CORE FUNCTIONS
+# 2. CORE FUNCTIONS (BYBIT VERSION)
 # =========================
 @st.cache_resource
 def get_exchange():
-    return ccxt.binance({
+    return ccxt.bybit({
         "enableRateLimit": True,
-        "options": {"defaultType": "future"},
+        # Bybit не потребує 'defaultType': 'future' в опціях так суворо як Binance,
+        # але ми будемо фільтрувати ринки вручну.
     })
 
-def normalize_symbol(symbol: str) -> str:
-    """Fix symbol format for ccxt"""
-    if ":USDT" not in symbol and symbol.endswith("/USDT"):
-        return symbol  # CCXT часто розуміє і так, але для swap краще чистий тікер або правильний ID
-    return symbol
-
 def fmt_price(price: float) -> str:
-    """Smart price formatting"""
     if price >= 1000: return f"{price:.1f}"
     if price >= 10: return f"{price:.2f}"
     if price >= 1: return f"{price:.4f}"
     return f"{price:.6f}"
 
 # =========================
-# 3. DATA ENGINE (MULTI-THREADED)
+# 3. DATA ENGINE (BYBIT ADAPTED)
 # =========================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_top_usdt_perp_symbols(top_n: int):
     ex = get_exchange()
-    fallback = ["BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT","BNB/USDT"]
+    # Запасний список у форматі Bybit
+    fallback = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT"]
+    
     try:
         markets = ex.load_markets()
-        # Filter for active linear USDT swaps
+        
+        # Фільтр для Bybit USDT Perpetual (Linear)
+        # linear=True означає безстрокові контракти USDT
         active_perps = [
             s for s, m in markets.items() 
-            if m.get('swap') and m.get('linear') and m.get('active') and m.get('quote') == 'USDT'
+            if m.get('linear') is True 
+            and m.get('quote') == 'USDT' 
+            and m.get('active')
         ]
         
+        # Якщо список порожній (іноді буває через кеш ccxt), беремо fallback
+        if not active_perps:
+            return fallback, {}
+
+        # Отримуємо тікери
         tickers = ex.fetch_tickers(active_perps)
         scored = []
         for s, t in tickers.items():
@@ -82,6 +80,7 @@ def get_top_usdt_perp_symbols(top_n: int):
             change_24h = t.get('percentage', 0) or 0
             scored.append((s, vol, change_24h))
         
+        # Сортуємо за об'ємом
         scored.sort(key=lambda x: x[1], reverse=True)
         
         top_coins = [x[0] for x in scored[:top_n]]
@@ -94,9 +93,12 @@ def get_top_usdt_perp_symbols(top_n: int):
 def fetch_single_coin(args):
     """Worker function for threading"""
     symbol, tf, lim, ex_config = args
-    ex = ccxt.binance(ex_config) # Create new instance per thread
+    ex = ccxt.bybit(ex_config)
     try:
         bars = ex.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
+        if not bars:
+            return symbol, None, "No data"
+            
         df = pd.DataFrame(bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         return symbol, df, None
@@ -104,7 +106,7 @@ def fetch_single_coin(args):
         return symbol, None, str(e)
 
 # =========================
-# 4. LOGIC
+# 4. LOGIC (STANDARD)
 # =========================
 def calculate_indicators(df, rsi_per=14, atr_per=14, ema_per=200):
     if df is None or len(df) < ema_per: return df
@@ -149,6 +151,7 @@ def get_signal(row, oversold, overbought):
     return signal, trend, warning
 
 def generate_telegram_post(coin, price, atr, side, lev_range, offset_pct, sl_mult, tp_mults, tp_percents):
+    # Очищення назви (Bybit часто дає BTC/USDT:USDT -> залишаємо BTC)
     base = coin.split("/")[0]
     
     if side == "SHORT":
@@ -183,12 +186,13 @@ def generate_telegram_post(coin, price, atr, side, lev_range, offset_pct, sl_mul
 # =========================
 # 5. SIDEBAR
 # =========================
-st.sidebar.header("⚙️ Scanner Config")
+st.sidebar.header("⚙️ Bybit Scanner Config")
 
 with st.sidebar.expander("🌍 Coins & Mode", expanded=False):
     scan_mode = st.radio("Mode:", ["Auto Top-Volume", "Manual"], index=0)
     n_coins = st.slider("Coins count", 10, 50, 20)
-    manual_coins = st.multiselect("Manual list", ["BTC/USDT", "ETH/USDT", "SOL/USDT"], default=["BTC/USDT"])
+    # Ручний вибір у форматі Bybit
+    manual_coins = st.multiselect("Manual list", ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"], default=["BTC/USDT:USDT"])
 
 with st.sidebar.expander("📊 Strategy", expanded=False):
     tf = st.selectbox("Timeframe", ["5m", "15m", "1h", "4h"], index=1)
@@ -198,10 +202,10 @@ with st.sidebar.expander("📊 Strategy", expanded=False):
     ema_len = st.number_input("EMA Trend", 50, 200, 200)
 
 with st.sidebar.expander("💰 Risk Manager", expanded=False):
-    lev_range = (20, 50)
+    lev_range = (10, 20) # На Bybit плечі часто менші за дефолтом
     limit_offset = st.slider("Limit Offset %", 0.0, 3.0, 1.0) / 100
     sl_mult = st.slider("SL xATR", 1.0, 4.0, 2.0)
-    tp_setup = [1.0, 2.5, 4.0] # Fixed mostly for cleaner UI
+    tp_setup = [1.0, 2.5, 4.0] 
     tp_pcts = [50, 30, 20]
 
 # =========================
@@ -209,27 +213,25 @@ with st.sidebar.expander("💰 Risk Manager", expanded=False):
 # =========================
 col_act1, col_act2 = st.columns([3, 1])
 with col_act1:
-    st.info("💡 Використовуйте горизонтальну прокрутку для таблиць або перейдіть на вкладку 'Сигнали' для карток.")
+    st.info("💡 Bybit API зазвичай працює стабільніше. Використовуйте горизонтальну прокрутку для таблиць.")
 with col_act2:
-    start_btn = st.button("🚀 SCAN", type="primary")
+    start_btn = st.button("🚀 SCAN BYBIT", type="primary")
 
 if start_btn:
-    # 1. Prepare Coins
     coins = []
     changes = {}
     
-    with st.spinner("Fetching markets..."):
+    with st.spinner("Fetching Bybit markets..."):
         if scan_mode.startswith("Auto"):
             coins, changes = get_top_usdt_perp_symbols(n_coins)
         else:
             coins = manual_coins
 
-    # 2. Parallel Fetching (Speed Boost)
     status_bar = st.progress(0)
     results = []
     
-    # Args for thread worker
-    ex_conf = {"enableRateLimit": True, "options": {"defaultType": "future"}}
+    # Threading setup
+    ex_conf = {"enableRateLimit": True}
     tasks = [(c, tf, ema_len+50, ex_conf) for c in coins]
     
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -244,7 +246,6 @@ if start_btn:
                 
                 sig, trnd, warn = get_signal(last, os_level, ob_level)
                 
-                # Post generation
                 post_txt = ""
                 if sig:
                     post_txt = generate_telegram_post(
@@ -253,7 +254,7 @@ if start_btn:
                     )
 
                 results.append({
-                    "Coin": symbol,
+                    "Coin": symbol.replace("/USDT:USDT", ""), # Скорочуємо назву для краси
                     "Price": last["close"],
                     "RSI": last["rsi"],
                     "Trend": trnd,
@@ -265,17 +266,14 @@ if start_btn:
 
     status_bar.empty()
     
-    # 3. Visualization
     df_res = pd.DataFrame(results)
     
     if not df_res.empty:
-        # Sort logic: Signals first, then high volatility
         df_res["_sort"] = df_res["Signal"].apply(lambda x: 0 if x else 1)
         df_res = df_res.sort_values(["_sort", "RSI"], ascending=True)
 
         tab1, tab2 = st.tabs(["📱 Сигнали (Mobile)", "📊 Таблиця (Desktop)"])
         
-        # --- TAB 1: MOBILE CARDS ---
         with tab1:
             signals_only = df_res[df_res["Signal"].notna()]
             
@@ -283,7 +281,6 @@ if start_btn:
                 st.warning("No active signals found right now.")
             else:
                 for _, row in signals_only.iterrows():
-                    # Color coding
                     border_color = "#00ff00" if row["Signal"] == "LONG" else "#ff4b4b"
                     
                     with st.container():
@@ -301,23 +298,15 @@ if start_btn:
                         </div>
                         """, unsafe_allow_html=True)
                         
-                        # Copy button implementation via st.code
                         st.text("👇 Copy Signal:")
                         st.code(row["Post"], language="text")
                         st.divider()
 
-        # --- TAB 2: ADVANCED TABLE ---
         with tab2:
-            # Use Column Config for better visuals
             st.dataframe(
                 df_res.style.apply(lambda x: ['background-color: #1e3a2f' if x.Signal == 'LONG' else ('background-color: #3a1e1e' if x.Signal == 'SHORT' else '') for i in x], axis=1),
                 column_config={
-                    "RSI": st.column_config.ProgressColumn(
-                        "RSI Strength",
-                        format="%.1f",
-                        min_value=0,
-                        max_value=100,
-                    ),
+                    "RSI": st.column_config.ProgressColumn("RSI", format="%.1f", min_value=0, max_value=100),
                     "Price": st.column_config.NumberColumn(format="%.4f"),
                     "24h%": st.column_config.NumberColumn(format="%.2f%%"),
                 },
@@ -327,4 +316,4 @@ if start_btn:
                 column_order=["Coin", "Price", "24h%", "RSI", "Signal", "Trend", "Warning"]
             )
     else:
-        st.error("No data returned. Check API connection.")
+        st.error("Дані не отримані. Можливо, ваш IP (США) заблокований і на Bybit. Спробуйте VPN (Польща/Україна).")
