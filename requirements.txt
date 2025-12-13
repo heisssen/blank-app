@@ -1,1 +1,5 @@
 streamlit
+ccxt
+pandas
+numpy
+plotly
