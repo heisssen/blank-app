@@ -1,238 +1,289 @@
 import streamlit as st
-import ccxt
 import pandas as pd
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import numpy as np
+from datetime import datetime
 
-# ==========================================
+# =========================
 # 1. CONFIG & STYLES
-# ==========================================
-st.set_page_config(page_title="Arbitrage Debugger", layout="wide", page_icon="🛠️")
+# =========================
+st.set_page_config(page_title="Signal Post Generator", layout="centered", page_icon="📝")
 
 st.markdown("""
 <style>
+    /* Головний контейнер */
     .stApp { background-color: #0e1117; }
-    .debug-box { background: #1c1c1c; padding: 10px; border-radius: 5px; font-family: monospace; color: #00ff00; font-size: 12px; margin-bottom: 5px; border-left: 3px solid #00ff00; }
-    .error-box { background: #2b1111; padding: 10px; border-radius: 5px; font-family: monospace; color: #ff4b4b; font-size: 12px; margin-bottom: 5px; border-left: 3px solid #ff4b4b; }
-    .success-card { background: #123a2a; padding: 15px; border-radius: 10px; border: 1px solid #40ff9a; margin-bottom: 10px; }
+    /* Картка з результатом */
+    .signal-card {
+        background-color: #1a1c24;
+        border-radius: 12px;
+        padding: 20px;
+        margin-top: 20px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.4);
+    }
+    /* Заголовок (LONG/SHORT) */
+    .direction-title {
+        font-size: 1.8em;
+        font-weight: 800;
+        margin-bottom: 10px;
+        color: white;
+    }
+    /* Блок з R:R */
+    .rr-box {
+        background-color: #2b2d35;
+        padding: 10px;
+        border-radius: 8px;
+        text-align: center;
+        margin-top: 15px;
+    }
+    .rr-value {
+        font-size: 1.5em;
+        font-weight: 900;
+        color: #40ff9a; /* GREEN */
+    }
+    .rr-label {
+        font-size: 0.8em;
+        color: #8b92a6;
+    }
+    /* Код для Telegram */
+    .stCodeBlock {
+        background-color: #121418;
+        border-radius: 8px;
+        border: 1px solid #2b2d35;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛠️ Arbitrage Scanner: DEBUG MODE")
-st.warning("Цей режим показує всі технічні деталі, щоб зрозуміти, чому не знаходяться пари.")
+st.title("📝 Генератор Торгових Сигналів")
+st.caption("Автоматичний розрахунок R:R та створення поста для Telegram")
+st.divider()
 
-# ==========================================
-# 2. EXCHANGE SETUP
-# ==========================================
-EXCHANGE_IDS = ['binance', 'bybit', 'okx', 'kraken', 'kucoin', 'gateio', 'huobi', 'mexc']
+# =========================
+# 2. HELPER FUNCTIONS
+# =========================
 
-@st.cache_resource
-def init_exchange(ex_id):
+def safe_float(x):
+    """Конвертація в float з обробкою помилок"""
     try:
-        exchange_class = getattr(ccxt, ex_id)
-        return exchange_class({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'} 
-        })
-    except Exception as e:
+        return float(x)
+    except:
+        return np.nan
+
+def fmt_price(p):
+    """Форматування ціни згідно її величини"""
+    if not np.isfinite(p): return "N/A"
+    if p >= 10: return f"{p:.4f}"
+    if p >= 0.1: return f"{p:.6f}"
+    return f"{p:.8f}"
+
+def calculate_metrics(entry, sl, tps, direction):
+    """Розрахунок R:R та %-змін"""
+    entry = safe_float(entry)
+    sl = safe_float(sl)
+    tps = [safe_float(tp) for tp in tps if safe_float(tp) > 0]
+    
+    if not np.isfinite(entry) or not np.isfinite(sl) or not tps:
+        return None
+    
+    # 1. Визначення базового Ризику
+    risk = abs(entry - sl)
+    if risk == 0: return None
+    
+    # Перевірка на валідність напрямку
+    if (direction == "LONG" and sl >= entry) or (direction == "SHORT" and sl <= entry):
+        st.error(f"Помилка: Для {direction} SL має бути {'нижче' if direction == 'LONG' else 'вище'} ціни входу.")
         return None
 
-# ==========================================
-# 3. LOGIC WITH LOGGING
-# ==========================================
+    results = {
+        "risk_abs": risk,
+        "risk_pct": risk / entry * 100,
+        "entry": entry,
+        "sl": sl,
+        "tps": []
+    }
 
-def normalize_symbol(symbol):
-    """Виправляє Kraken XBT та інші аномалії"""
-    if not symbol: return ""
-    # Kraken fix
-    if "XBT" in symbol:
-        symbol = symbol.replace("XBT", "BTC")
-    return symbol
+    # 2. Розрахунок Прибутку та R:R для кожного TP
+    for i, tp in enumerate(tps):
+        if (direction == "LONG" and tp <= entry) or (direction == "SHORT" and tp >= entry):
+            continue # Пропускаємо невалідні TP
 
-def get_tickers_safe(ex, ex_id):
-    try:
-        # Для деяких бірж краще явно вказати fetch_tickers() без аргументів
-        tickers = ex.fetch_tickers()
-        return tickers
-    except Exception as e:
-        st.markdown(f"<div class='error-box'>❌ {ex_id}: Помилка fetch_tickers: {e}</div>", unsafe_allow_html=True)
-        return {}
-
-def run_debug_scan(selected_exchanges, limit_top_n):
-    
-    # 1. ЗАВАНТАЖЕННЯ РИНКІВ
-    st.subheader("1. Завантаження ринків (Load Markets)")
-    
-    market_sets = {} # ex_id -> set of symbols
-    
-    col_log = st.container()
-    
-    with col_log:
-        for ex_id in selected_exchanges:
-            ex = init_exchange(ex_id)
-            if not ex:
-                st.markdown(f"<div class='error-box'>Не вдалося ініціалізувати {ex_id}</div>", unsafe_allow_html=True)
-                continue
-            
-            try:
-                # Завантажуємо ринки
-                markets = ex.load_markets()
-                
-                # Фільтруємо ТІЛЬКИ USDT SPOT
-                valid_symbols = []
-                for s, m in markets.items():
-                    # Дуже м'який фільтр для тесту
-                    if m.get('quote') == 'USDT' and m.get('spot', True) and m.get('active', True):
-                        # Нормалізація назви (щоб Kraken XBT/USDT стало BTC/USDT)
-                        norm_s = normalize_symbol(s)
-                        valid_symbols.append(norm_s)
-                
-                valid_set = set(valid_symbols)
-                market_sets[ex_id] = valid_set
-                
-                st.markdown(f"<div class='debug-box'>✅ <b>{ex_id.upper()}</b>: Завантажено {len(markets)} ринків -> З них {len(valid_set)} USDT Spot пар.</div>", unsafe_allow_html=True)
-                
-                # Показати приклад пар для перевірки
-                sample = list(valid_set)[:5]
-                st.caption(f"Приклади пар {ex_id}: {sample}")
-                
-            except Exception as e:
-                st.markdown(f"<div class='error-box'>❌ {ex_id}: Критична помилка load_markets: {e}</div>", unsafe_allow_html=True)
-
-    # 2. ПОШУК СПІЛЬНИХ ПАР
-    st.subheader("2. Пошук перетинів (Common Pairs)")
-    
-    if len(market_sets) < 2:
-        st.error("Потрібно успішно завантажити дані мінімум з 2 бірж.")
-        return
-
-    # Знаходимо спільні елементи у всіх вибраних сетах
-    # Використовуємо intersection всіх множин
-    common_symbols = set.intersection(*market_sets.values())
-    
-    st.markdown(f"📊 **Знайдено спільних пар:** `{len(common_symbols)}`")
-    
-    if len(common_symbols) == 0:
-        st.error("⚠️ Нуль спільних пар! Це означає, що назви монет не співпадають або фільтр занадто суворий.")
-        st.info("Спробуємо знайти пари, які є хоча б на 2 біржах (а не на всіх зразу)...")
+        profit_abs = abs(tp - entry)
+        rr = profit_abs / risk
         
-        # Fallback: пари, які є хоча б на 2 біржах
-        all_syms = [item for sublist in market_sets.values() for item in sublist]
-        from collections import Counter
-        counts = Counter(all_syms)
-        common_symbols = [s for s, c in counts.items() if c >= 2]
-        st.success(f"🔎 Знайдено пар, які є хоча б на 2-х біржах: {len(common_symbols)}")
+        results["tps"].append({
+            "tp": tp,
+            "profit_abs": profit_abs,
+            "profit_pct": profit_abs / entry * 100,
+            "rr": rr
+        })
+        
+    if not results["tps"]:
+        st.error("Помилка: Усі TP знаходяться на невірній стороні або дорівнюють точці входу.")
+        return None
 
-    # Перетворюємо в список і обрізаємо
-    target_list = list(common_symbols)
-    # Сортуємо просто за алфавітом, бо у нас немає поки об'ємів
-    target_list.sort()
+    # Додаємо загальну метрику (R:R беремо від останнього TP)
+    results["max_rr"] = results["tps"][-1]["rr"]
+    results["max_profit_pct"] = results["tps"][-1]["profit_pct"]
     
-    if limit_top_n > 0:
-        target_list = target_list[:limit_top_n]
-        st.caption(f"Взято перші {limit_top_n} для тесту.")
+    return results
 
-    st.text_area("Список монет для скану:", ", ".join(target_list), height=60)
-
-    # 3. ОТРИМАННЯ ЦІН (FETCH TICKERS)
-    st.subheader("3. Отримання цін (Fetch Tickers)")
+def generate_telegram_post(coin, direction, leverage, market_entry, limit_entry, sl, tps, metrics):
+    """Генерація тексту для Телеграм"""
+    emoji = "🟢" if direction == "LONG" else "🔴"
     
-    final_opportunities = []
+    # Формування тіла
+    txt = f"#{coin.upper().split('/')[0]} {emoji} {direction} x{leverage}\n"
+    txt += "\n"
     
-    progress = st.progress(0)
-    
-    # Словник для зберігання цін: prices[symbol][ex_id] = {'bid': ..., 'ask': ...}
-    prices_db = {} 
-
-    # Тягнемо тікери паралельно
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_ex = {executor.submit(get_tickers_safe, init_exchange(ex), ex): ex for ex in selected_exchanges}
-        
-        completed = 0
-        for future in as_completed(future_to_ex):
-            ex_id = future_to_ex[future]
-            tickers = future.result()
-            completed += 1
-            progress.progress(completed / len(selected_exchanges))
-            
-            if not tickers:
-                continue
-                
-            count_matched = 0
-            for s, t in tickers.items():
-                norm_s = normalize_symbol(s)
-                if norm_s in target_list:
-                    if norm_s not in prices_db: prices_db[norm_s] = {}
-                    
-                    bid = t.get('bid')
-                    ask = t.get('ask')
-                    
-                    if bid and ask:
-                        prices_db[norm_s][ex_id] = {'bid': bid, 'ask': ask}
-                        count_matched += 1
-            
-            st.markdown(f"<div class='debug-box'>📥 <b>{ex_id.upper()}</b>: Отримано ціни для {count_matched} цільових монет.</div>", unsafe_allow_html=True)
-
-    # 4. РОЗРАХУНОК СПРЕДІВ
-    st.subheader("4. Результати (Calculation)")
-    
-    for symbol, ex_data in prices_db.items():
-        if len(ex_data) < 2: continue
-        
-        # Знаходимо макс бід і мін аск
-        # ex_data = {'binance': {'bid': 100, 'ask': 101}, 'bybit': ...}
-        
-        best_buy = min(ex_data.items(), key=lambda x: x[1]['ask']) # (ex, {data})
-        best_sell = max(ex_data.items(), key=lambda x: x[1]['bid'])
-        
-        buy_ex = best_buy[0]
-        buy_price = best_buy[1]['ask']
-        
-        sell_ex = best_sell[0]
-        sell_price = best_sell[1]['bid']
-        
-        if sell_price > buy_price:
-            diff_pct = ((sell_price - buy_price) / buy_price) * 100
-            
-            # Груба оцінка комісій (0.1% + 0.1% = 0.2%)
-            est_fees = 0.2 
-            net_profit = diff_pct - est_fees
-            
-            if net_profit > 0.1: # Показуємо все, що більше 0.1% для тесту
-                final_opportunities.append({
-                    'symbol': symbol,
-                    'buy': f"{buy_ex} ({buy_price})",
-                    'sell': f"{sell_ex} ({sell_price})",
-                    'gross%': round(diff_pct, 2),
-                    'net%': round(net_profit, 2)
-                })
-
-    if not final_opportunities:
-        st.warning("☹️ Ціни отримані, але арбітражних ситуацій > 0.1% не знайдено.")
+    # Входи
+    if market_entry > 0 and limit_entry > 0:
+        txt += f"✅ Вхід: два ордери\n"
+        txt += f"Рынок {fmt_price(market_entry)}\n"
+        txt += f"Лимит {fmt_price(limit_entry)}\n"
+        avg_entry = (market_entry + limit_entry) / 2
+        txt += f"> Сер. ціна: {fmt_price(avg_entry)}\n"
+    elif market_entry > 0:
+        txt += f"✅ Вхід (Market): {fmt_price(market_entry)}\n"
+        avg_entry = market_entry
     else:
-        df = pd.DataFrame(final_opportunities)
-        df = df.sort_values('net%', ascending=False)
+        txt += f"✅ Вхід (Limit): {fmt_price(limit_entry)}\n"
+        avg_entry = limit_entry
+
+    txt += "\n"
+    
+    # Take-Profit (використовуємо дані з розрахунками)
+    txt += "💸 Take-Profit:\n"
+    for i, tp_data in enumerate(metrics['tps']):
+        rr_txt = f" (R:R {tp_data['rr']:.1f})"
+        txt += f"{i+1}) {fmt_price(tp_data['tp'])} | +{tp_data['profit_pct']:.2f}%{rr_txt}\n"
         
-        for index, row in df.iterrows():
-            st.markdown(f"""
-            <div class="success-card">
-                <h3 style="margin:0; color:#fff">{row['symbol']} <span style="float:right; color:#40ff9a">NET: {row['net%']}%</span></h3>
-                <div style="color:#aaa; margin-top:5px;">
-                    🔵 BUY: <b>{row['buy']}</b> <br>
-                    🔴 SELL: <b>{row['sell']}</b> <br>
-                    Gross: {row['gross%']}% (Fees approx 0.2%)
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+    txt += "\n"
+    
+    # Stop-Loss
+    risk_pct = metrics['risk_pct']
+    txt += f"❌ Stop-loss: {fmt_price(sl)} | -{risk_pct:.2f}%\n"
+    
+    txt += "\n"
+    # Метрики
+    txt += f"💎 Макс R:R: 1:{metrics['max_rr']:.1f}\n"
+    txt += f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    
+    return txt
 
-# ==========================================
-# 5. SIDEBAR & RUN
-# ==========================================
+# =========================
+# 3. UI INPUTS (Sidebar)
+# =========================
+
 with st.sidebar:
-    st.header("Налаштування")
-    selected_exs = st.multiselect("Біржі", EXCHANGE_IDS, default=['binance', 'bybit', 'kucoin'])
-    limit = st.slider("Ліміт монет для тесту", 10, 100, 20)
-    st.info("Якщо ви виберете занадто багато бірж, процес може зайняти час.")
+    st.header("Вхідні дані сигналу")
 
-if st.button("🚀 ЗАПУСТИТИ ДІАГНОСТИКУ", type="primary"):
-    run_debug_scan(selected_exs, limit)
+    # Основні параметри
+    coin = st.text_input("Тікер монети", "XLM/USDT").upper()
+    direction = st.radio("Напрямок", ["SHORT", "LONG"], index=0)
+    leverage = st.text_input("Кредитне плече", "x20-25")
+    
+    st.divider()
+    
+    # Ціни входу
+    st.subheader("Ціни Входу (USD)")
+    entry_market = st.number_input("1. Market (Рынок)", value=0.23802, format="%.8f")
+    entry_limit = st.number_input("2. Limit (Ліміт)", value=0.243, format="%.8f")
+    
+    # SL
+    st.subheader("Stop-Loss (USD)")
+    sl_price = st.number_input("Stop-loss", value=0.2484, format="%.8f")
+    
+    # TP (до 5)
+    st.subheader("Take-Profit (USD)")
+    tp1 = st.number_input("TP 1", value=0.2351, format="%.8f")
+    tp2 = st.number_input("TP 2", value=0.2284, format="%.8f")
+    tp3 = st.number_input("TP 3", value=0.1988, format="%.8f")
+    tp4 = st.number_input("TP 4", value=0.0, format="%.8f")
+    tp5 = st.number_input("TP 5", value=0.0, format="%.8f")
+    
+    tps_input = [tp1, tp2, tp3, tp4, tp5]
+    
+    st.divider()
+    if st.button("Згенерувати Пост"):
+        st.session_state['run_calc'] = True
+    else:
+        st.session_state['run_calc'] = False
+
+# =========================
+# 4. MAIN OUTPUT
+# =========================
+
+if st.session_state.get('run_calc', False) or st.button("Показати результати", key='main_btn'):
+    
+    # 1. Визначення ціни для розрахунків (використовуємо середню, якщо обидві вказані)
+    if entry_market > 0 and entry_limit > 0:
+        calc_entry = (entry_market + entry_limit) / 2
+        entry_description = f"Сер. Вхід: {fmt_price(calc_entry)}"
+    elif entry_market > 0:
+        calc_entry = entry_market
+        entry_description = f"Вхід: {fmt_price(calc_entry)} (Market)"
+    elif entry_limit > 0:
+        calc_entry = entry_limit
+        entry_description = f"Вхід: {fmt_price(calc_entry)} (Limit)"
+    else:
+        st.error("Введіть хоча б одну ціну входу (Market або Limit).")
+        st.stop()
+        
+    # 2. Розрахунок метрик
+    metrics = calculate_metrics(calc_entry, sl_price, tps_input, direction)
+    
+    if metrics is None:
+        st.error("Неможливо провести розрахунки. Перевірте вхідні дані та коректність SL/TP відносно ціни входу.")
+        st.stop()
+        
+    # 3. Генерація тексту
+    telegram_post = generate_telegram_post(
+        coin, direction, leverage, entry_market, entry_limit, sl_price, tps_input, metrics
+    )
+
+    # 4. Відображення результатів
+    
+    st.markdown(f"""
+    <div class="signal-card">
+        <div class="direction-title" style="color: {'#40ff9a' if direction == 'LONG' else '#ff4b4b'}">
+            #{coin.upper().split('/')[0]} | {direction}
+        </div>
+        
+        <div class="rr-box">
+            <div class="rr-label">Максимальне співвідношення R:R</div>
+            <div class="rr-value">1:{metrics['max_rr']:.1f}</div>
+            <div class="rr-label">Профіт до останнього TP: +{metrics['max_profit_pct']:.2f}%</div>
+        </div>
+        
+        <h4 style="margin-top:20px; color:#ccc;">📝 Розрахунок</h4>
+    """, unsafe_allow_html=True)
+
+    # Таблиця з TP
+    data = []
+    for tp_data in metrics['tps']:
+        data.append({
+            "TP Price": fmt_price(tp_data['tp']),
+            "Profit %": f"+{tp_data['profit_pct']:.2f}%",
+            "R:R": f"1:{tp_data['rr']:.1f}"
+        })
+        
+    col_tps, col_risk = st.columns(2)
+    
+    with col_tps:
+        st.subheader("🎯 Take-Profit рівні")
+        st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+    
+    with col_risk:
+        st.subheader("🛡️ Ризик")
+        st.metric(label="Розрахункова ціна входу", value=entry_description)
+        st.metric(label="Stop-Loss", value=fmt_price(sl_price))
+        st.metric(label="Ризик до SL", value=f"-{metrics['risk_pct']:.2f}%", delta_color="inverse")
+    
+    st.divider()
+
+    # 5. Генератор поста
+    st.subheader("📩 Готовий пост для Telegram (Копіювати)")
+    st.code(telegram_post, language="text")
+
+# Інакше показуємо інструкцію
+else:
+    st.info("Введіть параметри сигналу в бічній панелі та натисніть 'Показати результати'.")
