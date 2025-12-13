@@ -69,29 +69,31 @@ def fmt_price(price):
 
 
 def normalize_manual_item(x: str) -> tuple[str, str]:
-    """Приймає 'BTC/USDT', 'BTCUSDT', 'btc/usdt' і т.п. Повертає (base, quote)."""
     x = (x or "").strip().upper().replace(" ", "")
     if not x:
         return ("", "")
-
     if "/" in x:
         base, quote = x.split("/", 1)
         return base, quote
-
-    # евристика: BTCUSDT -> BTC/USDT
     if x.endswith("USDT"):
         return x[:-4], "USDT"
     if x.endswith("USD"):
         return x[:-3], "USD"
-
-    # якщо незрозуміло — вважаємо USDT
     return x, "USDT"
+
+
+def safe_float(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
 
 
 # =========================
 # 3. DATA ENGINE
 # =========================
-# ✅ Важливо: KuCoin та Kraken futures мають окремі класи в CCXT
 EXCHANGE_CLASSES = {
     "binance": ccxt.binance,
     "bybit": ccxt.bybit,
@@ -99,29 +101,23 @@ EXCHANGE_CLASSES = {
     "okx": ccxt.okx,
     "kraken": ccxt.krakenfutures,
 }
-
 SUPPORTED_EXCHANGES = list(EXCHANGE_CLASSES.keys())
 
 
 @st.cache_resource
 def get_exchange_config(exchange_id: str):
-    """
-    Базова конфігурація. Не створюємо тут інстанс біржі.
-    defaultType відрізняється між біржами.
-    """
     config = {"enableRateLimit": True, "options": {}}
 
-    # практично корисні дефолти для деривативів
     if exchange_id == "binance":
-        config["options"]["defaultType"] = "future"  # USDⓈ-M futures
+        config["options"]["defaultType"] = "future"
     elif exchange_id == "bybit":
-        config["options"]["defaultType"] = "swap"    # perp
+        config["options"]["defaultType"] = "swap"
     elif exchange_id == "kucoin":
-        config["options"]["defaultType"] = "swap"    # kucoin futures = swap/perp в ccxt
+        config["options"]["defaultType"] = "swap"
     elif exchange_id == "okx":
-        config["options"]["defaultType"] = "swap"    # OKX swap
+        config["options"]["defaultType"] = "swap"
     elif exchange_id == "kraken":
-        config["options"]["defaultType"] = "future"  # Kraken Futures
+        config["options"]["defaultType"] = "future"
     else:
         config["options"]["defaultType"] = "swap"
 
@@ -129,13 +125,6 @@ def get_exchange_config(exchange_id: str):
 
 
 def is_target_derivative_market(exchange_id: str, m: dict) -> bool:
-    """
-    Надійний фільтр деривативів:
-    - active
-    - contract (swap/future)
-    - quote (USDT для більшості; для Kraken часто USD)
-    - для USDT-маржинальних бірж: linear True
-    """
     if not m or not m.get("active"):
         return False
 
@@ -143,16 +132,12 @@ def is_target_derivative_market(exchange_id: str, m: dict) -> bool:
     if m.get("quote") not in allowed_quotes:
         return False
 
-    # contract=True відділяє деривативи від spot
     if not m.get("contract"):
         return False
 
-    # маємо бути swap або future
     if not (m.get("swap") or m.get("future")):
         return False
 
-    # Для більшості “USDT perpetual” хочемо linear (USDT-margined)
-    # Kraken futures може мати інші поля/структуру — не душимо.
     if exchange_id != "kraken":
         if not m.get("linear", False):
             return False
@@ -160,13 +145,21 @@ def is_target_derivative_market(exchange_id: str, m: dict) -> bool:
     return True
 
 
+def _rank01(values: list[float]) -> list[float]:
+    """Ранг 0..1 (чим більше значення, тим ближче до 1). Стабільно при однакових значеннях."""
+    if not values:
+        return []
+    arr = np.array(values, dtype=float)
+    if np.all(arr == arr[0]):
+        return [0.5] * len(values)
+    order = arr.argsort()
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.linspace(0.0, 1.0, len(arr))
+    return ranks.tolist()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_market_data(exchange_id: str, scan_mode: str, top_n: int, manual_list: list):
-    """
-    Отримує список символів та 24h%:
-    - Auto: беремо всі деривативи, ранжуємо по об’єму, обрізаємо топ-N
-    - Manual: матчимо по base/quote, але повертаємо реальні symbol біржі
-    """
     config = get_exchange_config(exchange_id)
     ExClass = EXCHANGE_CLASSES.get(exchange_id)
     if not ExClass:
@@ -177,7 +170,7 @@ def get_market_data(exchange_id: str, scan_mode: str, top_n: int, manual_list: l
     try:
         markets = ex.load_markets()
 
-        # --- 1) Формуємо пул символів
+        # --- 1) пул символів
         if scan_mode.startswith("Auto"):
             target_symbols = [s for s, m in markets.items() if is_target_derivative_market(exchange_id, m)]
         else:
@@ -199,38 +192,57 @@ def get_market_data(exchange_id: str, scan_mode: str, top_n: int, manual_list: l
                 if found:
                     target_symbols.append(found)
 
-        # прибираємо дублікати
         target_symbols = list(dict.fromkeys(target_symbols))
         if not target_symbols:
             return [], {}
 
-        # --- 2) Тікери: пробуємо fetch_tickers(list), якщо падає — беремо всі і фільтруємо
+        # --- 2) тікери (з fallback)
         try:
             tickers = ex.fetch_tickers(target_symbols)
         except Exception:
             tickers_all = ex.fetch_tickers()
             tickers = {k: v for k, v in tickers_all.items() if k in target_symbols}
 
-        scored = []
+        rows = []
         for s in target_symbols:
             t = tickers.get(s) or {}
-            vol = t.get("quoteVolume") or t.get("baseVolume") or t.get("volume") or 0
-            chg = t.get("percentage") or 0
+            last = safe_float(t.get("last"), default=np.nan)
+            vol = safe_float(t.get("quoteVolume") or t.get("baseVolume") or t.get("volume"), default=0.0)
+            chg = safe_float(t.get("percentage"), default=0.0)
 
-            try:
-                vol = float(vol) if vol else 0.0
-            except Exception:
-                vol = 0.0
+            # ✅ відсів “зомбі” вже на рівні тікерів: нема ціни / нема об'єму
+            if scan_mode.startswith("Auto"):
+                if not np.isfinite(last) or last <= 0:
+                    continue
+                if vol <= 0:
+                    continue
 
-            try:
-                chg = float(chg) if chg is not None else 0.0
-            except Exception:
-                chg = 0.0
+            rows.append((s, vol, chg))
 
-            scored.append((s, vol, chg))
+        if not rows:
+            return [], {}
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        final = scored[: (top_n if scan_mode.startswith("Auto") else len(scored))]
+        # --- 3) скоринг
+        if scan_mode.startswith("Auto (Top Volume)"):
+            rows.sort(key=lambda x: x[1], reverse=True)
+        elif scan_mode.startswith("Auto (Volume + Movers)"):
+            vols = [r[1] for r in rows]
+            movers = [abs(r[2]) for r in rows]
+            vr = _rank01(vols)
+            mr = _rank01(movers)
+            scored = []
+            # вага: 70% ліквідність + 30% рух
+            for (sym, vol, chg), vrr, mrr in zip(rows, vr, mr):
+                score = 0.7 * vrr + 0.3 * mrr
+                scored.append((sym, vol, chg, score))
+            scored.sort(key=lambda x: x[3], reverse=True)
+            rows = [(a, b, c) for a, b, c, _ in scored]
+        else:
+            # на всяк випадок
+            rows.sort(key=lambda x: x[1], reverse=True)
+
+        limit = top_n if scan_mode.startswith("Auto") else len(rows)
+        final = rows[:limit]
 
         coins = [x[0] for x in final]
         changes = {x[0]: x[2] for x in final}
@@ -241,8 +253,53 @@ def get_market_data(exchange_id: str, scan_mode: str, top_n: int, manual_list: l
         return [], {}
 
 
+def is_zombie_ohlcv(df: pd.DataFrame) -> bool:
+    """
+    Фільтр “зомбі-ринків”:
+    - дуже мало варіації ціни (пласка/стоїть)
+    - нульовий/майже нульовий об’єм
+    - дивні/порожні свічки
+    """
+    if df is None or df.empty:
+        return True
+
+    if len(df) < 120:
+        return True
+
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    vol = df["volume"].astype(float)
+
+    if not np.isfinite(close.iloc[-1]) or close.iloc[-1] <= 0:
+        return True
+
+    # об'єм
+    if vol.replace([np.inf, -np.inf], np.nan).fillna(0).sum() <= 0:
+        return True
+
+    # унікальність close (якщо майже не змінюється — підозріло)
+    if close.nunique(dropna=True) < 10:
+        return True
+
+    # відносний діапазон за останні N свічок
+    N = min(200, len(df))
+    c = close.tail(N)
+    hi = high.tail(N)
+    lo = low.tail(N)
+
+    prange = (hi.max() - lo.min())
+    if prange <= 0:
+        return True
+
+    rel = prange / max(1e-12, c.median())
+    if rel < 0.001:  # <0.1% руху на 200 свічках — майже “мертво”
+        return True
+
+    return False
+
+
 def fetch_candle_data(args):
-    """Потокове завантаження OHLCV"""
     symbol, tf, limit, exchange_id, config = args
     ExClass = EXCHANGE_CLASSES.get(exchange_id)
     if not ExClass:
@@ -251,9 +308,8 @@ def fetch_candle_data(args):
     ex = ExClass(config)
 
     try:
-        time.sleep(0.1)  # м’яка пауза проти rate-limit у потоках
+        time.sleep(0.1)
 
-        # OKX іноді потребує load_markets для коректного парсингу символа
         if exchange_id == "okx":
             ex.load_markets()
 
@@ -263,7 +319,13 @@ def fetch_candle_data(args):
 
         df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+
+        # ✅ фільтр “зомбі” після OHLCV
+        if is_zombie_ohlcv(df):
+            return symbol, None, "Zombie/Illiquid Market"
+
         return symbol, df, None
+
     except Exception as e:
         return symbol, None, str(e)
 
@@ -279,17 +341,14 @@ def analyze_market(df: pd.DataFrame, rsi_len: int, ema_len: int, os_level: float
     high = df["high"].astype(float)
     low = df["low"].astype(float)
 
-    # RSI (Wilder-like via ewm)
+    # RSI
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / rsi_len, adjust=False).mean()
     loss = (-delta).clip(lower=0).ewm(alpha=1 / rsi_len, adjust=False).mean()
-
-    # якщо loss==0 -> RSI=100; якщо gain==0 -> RSI=0
     rs = pd.Series(np.where(loss.values == 0, np.inf, (gain / loss).values), index=df.index)
-    rsi = 100 - (100 / (1 + rs))
-    df["rsi"] = rsi
+    df["rsi"] = 100 - (100 / (1 + rs))
 
-    # ATR (True Range, ewm)
+    # ATR (True Range)
     prev_close = close.shift(1)
     tr = pd.concat(
         [
@@ -346,10 +405,8 @@ def create_telegram_post(coin, data, params, exchange_id):
 
     emoji = "🟢" if side == "LONG" else "🔴"
 
-    # Limit entry
     limit_price = price * (1 - offset) if side == "LONG" else price * (1 + offset)
 
-    # SL/TP from limit
     if side == "LONG":
         sl_price = limit_price - (atr * sl_mult)
         tp_prices = [limit_price + (atr * m) for m in tps]
@@ -370,7 +427,6 @@ def create_telegram_post(coin, data, params, exchange_id):
         txt += f"💰 TP{i+1}: {fmt_price(tp)}\n"
     txt += "------------------\n"
     txt += f"⚖️ RR: 1:{rr:.1f} | Market: {fmt_price(price)}"
-
     return txt
 
 
@@ -381,9 +437,13 @@ st.sidebar.header("🛠️ Налаштування")
 
 with st.sidebar.expander("🌐 Біржа та Активи", expanded=True):
     exch = st.selectbox("Біржа", SUPPORTED_EXCHANGES, format_func=str.upper)
-    mode = st.radio("Режим пошуку", ["Auto (Top Volume)", "Manual List"])
 
-    if "Auto" in mode:
+    mode = st.radio(
+        "Режим пошуку",
+        ["Auto (Top Volume)", "Auto (Volume + Movers)", "Manual List"],
+    )
+
+    if mode.startswith("Auto"):
         n_coins = st.slider("Кількість монет", 10, 150, 30)
         manual_coins = []
     else:
@@ -414,12 +474,11 @@ run = c2.button("🚀 ЗАПУСТИТИ СКАНЕР", type="primary", use_cont
 
 if run:
     with st.spinner("Отримання ринкових даних..."):
-        # важливо: чистимо саме cache_data, щоб взяти свіжий топ/список
         get_market_data.clear()
         coins, changes_dict = get_market_data(exch, mode, n_coins, manual_coins)
 
     if not coins:
-        st.error("Не знайдено монет. Перевірте список або налаштування (особливо Manual).")
+        st.error("Не знайдено монет. Перевір налаштування/список. (Auto ще й відсікає нуль-об’єм та без ціни)")
         st.stop()
 
     progress = st.progress(0)
@@ -428,7 +487,7 @@ if run:
     results = []
 
     ex_conf = get_exchange_config(exch)
-    candle_limit = max(ema_len + 50, 250)  # запас під EMA/RSI/ATR
+    candle_limit = max(ema_len + 50, 250)
     tasks = [(c, tf, candle_limit, exch, ex_conf) for c in coins]
 
     MAX_WORKERS = 5
@@ -473,12 +532,10 @@ if run:
     df_res = pd.DataFrame(results)
 
     if df_res.empty:
-        st.warning("Дані не отримано (або все відвалилось на API/rate-limit).")
+        st.warning("Дані не отримано (або все відвалилось на API / відсіялось як illiquid).")
         st.stop()
 
-    # =========================
-    # Sorting (✅ фікс NaN/None)
-    # =========================
+    # ✅ фікс сортування: NaN/None не “True”
     df_res["_sort_sig"] = df_res["Signal"].apply(lambda x: 1 if pd.isna(x) else 0)
     df_res["_sort_rsi"] = df_res.apply(
         lambda r: r["RSI"]
@@ -490,7 +547,6 @@ if run:
 
     tab_sig, tab_all = st.tabs(["📱 Сигнали", "📋 Всі Результати"])
 
-    # --- MOBILE VIEW ---
     with tab_sig:
         signals = df_res[df_res["Signal"].isin(["LONG", "SHORT"])]
         if signals.empty:
@@ -526,7 +582,6 @@ if run:
                 with st.expander("📋 Копіювати сигнал"):
                     st.code(row["Post"], language="text")
 
-    # --- DESKTOP TABLE ---
     with tab_all:
         view = df_res[["Coin", "Price", "24h%", "RSI", "Signal", "Trend", "Warning"]].copy()
 
