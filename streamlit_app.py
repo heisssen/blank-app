@@ -7,81 +7,58 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 
 # =========================
-# 1. CONFIG & STYLES
+# 1. PAGE CONFIG
 # =========================
-st.set_page_config(page_title="Crypto Sniper Pro V2", layout="wide", page_icon="⚡")
-
-# Custom CSS for better tables
-st.markdown("""
-<style>
-    .stDataFrame {font-size: 14px;}
-    div[data-testid="stMetricValue"] {font-size: 18px;}
-</style>
-""", unsafe_allow_html=True)
-
-st.title("⚡ Crypto Sniper Pro V2: Risk Manager")
-st.markdown("Сканер RSI + Trend Filter + Генератор Money Management.")
+st.set_page_config(page_title="Crypto Sniper Pro", layout="wide", page_icon="📈")
+st.title("⚡ Crypto Futures Sniper")
+st.markdown("Сканер Binance Futures за RSI + генератор плану угоди (формат під Telegram).")
 
 # =========================
-# 2. CORE FUNCTIONS
+# 2. EXCHANGE & UTILS
 # =========================
 @st.cache_resource
 def get_exchange():
+    """Ініціалізація CCXT для Binance Futures"""
     ex = ccxt.binance({
         "enableRateLimit": True,
         "options": {"defaultType": "future"},
     })
+    try:
+        ex.load_markets()
+    except Exception:
+        pass
     return ex
 
 def normalize_symbol(symbol: str) -> list[str]:
+    """Додає варіанти символів для пошуку (наприклад, BTC/USDT:USDT)"""
     candidates = [symbol]
     if ":USDT" not in symbol and symbol.endswith("/USDT"):
         candidates.append(symbol.replace("/USDT", "/USDT:USDT"))
     return candidates
 
 def fmt_price(symbol_used: str, price: float) -> str:
-    """Розумне форматування ціни"""
-    if price >= 1000: return f"{price:.1f}"
-    if price >= 10: return f"{price:.2f}"
-    if price >= 1: return f"{price:.4f}"
-    return f"{price:.5f}" # Для монет типу 0.00023
-
-# =========================
-# 3. DATA ENGINE
-# =========================
-@st.cache_data(ttl=300, show_spinner=False)
-def get_top_usdt_perp_symbols(top_n: int):
+    """Форматує ціну згідно з точністю біржі"""
     ex = get_exchange()
-    fallback = ["BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT","BNB/USDT","DOGE/USDT","PEPE/USDT","ARB/USDT"]
     try:
-        # Завантажуємо ринки, щоб відфільтрувати тільки USDT Swap
-        markets = ex.load_markets()
-        active_perps = [
-            s for s, m in markets.items() 
-            if m.get('swap') and m.get('linear') and m.get('active') and m.get('quote') == 'USDT'
-        ]
-        
-        # Отримуємо тікери для сортування за об'ємом
-        tickers = ex.fetch_tickers(active_perps)
-        scored = []
-        for s, t in tickers.items():
-            vol = t.get('quoteVolume', 0) or 0
-            change_24h = t.get('percentage', 0) or 0
-            scored.append((s, vol, change_24h))
-        
-        # Сортуємо за об'ємом
-        scored.sort(key=lambda x: x[1], reverse=True)
-        
-        # Повертаємо список і словник зі зміною 24h (для відображення)
-        top_coins = [x[0] for x in scored[:top_n]]
-        changes_dict = {x[0]: x[2] for x in scored[:top_n]}
-        return top_coins, changes_dict
-    except:
-        return fallback, {}
+        # Спробуємо використати точність пари з біржі
+        return ex.price_to_precision(symbol_used, price)
+    except Exception:
+        # Fallback, якщо API не віддало точність
+        if price >= 1000:
+            return f"{price:.1f}"
+        elif price >= 1:
+            return f"{price:.4f}"
+        else:
+            return f"{price:.5f}"  # Як у прикладі 0.23802
 
+# =========================
+# 3. DATA FETCHING
+# =========================
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_ohlcv_cached(symbol: str, tf: str, lim: int):
     ex = get_exchange()
+    last_error = None
+
     for s in normalize_symbol(symbol):
         try:
             bars = ex.fetch_ohlcv(s, timeframe=tf, limit=lim)
@@ -90,279 +67,314 @@ def fetch_ohlcv_cached(symbol: str, tf: str, lim: int):
             df["symbol_used"] = s
             return df, None
         except Exception as e:
-            pass
-    return None, "Error fetching data"
+            last_error = str(e)
+
+    return None, last_error
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_top_usdt_perp_symbols(top_n: int):
+    """Отримує ТОП монет за об'ємом торгів (USDT Perps)"""
+    ex = get_exchange()
+    
+    # Список монет на випадок помилки API
+    fallback = [
+        "BTC/USDT","ETH/USDT","BNB/USDT","SOL/USDT","XRP/USDT","ADA/USDT","DOGE/USDT","SHIB/USDT",
+        "AVAX/USDT","LINK/USDT","DOT/USDT","TRX/USDT","LTC/USDT","BCH/USDT","ATOM/USDT","NEAR/USDT",
+        "OP/USDT","ARB/USDT","APT/USDT","SUI/USDT","FIL/USDT","INJ/USDT","RNDR/USDT","RUNE/USDT",
+        "PEPE/USDT","FLOKI/USDT","BONK/USDT","WIF/USDT","SEI/USDT","TON/USDT"
+    ]
+
+    try:
+        markets = ex.markets if hasattr(ex, "markets") and ex.markets else ex.load_markets()
+        allowed = set()
+        
+        # Фільтруємо тільки активні USDT ф'ючерси
+        for sym, m in markets.items():
+            if not m.get("active", True): continue
+            if not m.get("swap", False): continue     # Тільки перпетуал
+            if not m.get("linear", False): continue   # Тільки лінійні (USDT)
+            if m.get("quote") != "USDT": continue
+            allowed.add(sym)
+
+        tickers = ex.fetch_tickers()
+        scored = []
+        for sym, t in tickers.items():
+            if sym not in allowed: continue
+            qv = t.get("quoteVolume", 0) or 0
+            scored.append((sym, float(qv)))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = [s for s, _ in scored[:top_n]]
+        
+        return top if top else fallback[:top_n]
+    except Exception:
+        return fallback[:top_n]
 
 # =========================
-# 4. INDICATORS & LOGIC
+# 4. INDICATORS
 # =========================
-def calculate_indicators(df, rsi_per=14, atr_per=14, ema_per=200):
-    # RSI
-    delta = df["close"].diff()
+def rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1/rsi_per, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/rsi_per, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + rs))
 
-    # ATR
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift(1)).abs()
-    low_close = (df["low"] - df["close"].shift(1)).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=1/atr_per, adjust=False).mean()
-
-    # EMA Trend
-    df["ema"] = df["close"].ewm(span=ema_per, adjust=False).mean()
-    
-    return df
-
-def get_signal(row, oversold, overbought):
-    rsi = row["rsi"]
-    price = row["close"]
-    ema = row["ema"]
-    
-    # Визначаємо базовий сигнал RSI
-    signal = None
-    if rsi < oversold:
-        signal = "LONG"
-    elif rsi > overbought:
-        signal = "SHORT"
-    
-    # Аналіз тренду (фільтр)
-    trend = "NEUTRAL"
-    if price > ema * 1.001: trend = "BULLISH 🟢"
-    elif price < ema * 0.999: trend = "BEARISH 🔴"
-    
-    # Попередження (якщо шортимо проти бичачого тренду)
-    warning = ""
-    if signal == "SHORT" and "BULLISH" in trend:
-        warning = "⚠️ Counter-Trend"
-    if signal == "LONG" and "BEARISH" in trend:
-        warning = "⚠️ Counter-Trend"
-        
-    return signal, trend, warning
+def atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
 # =========================
-# 5. TEXT GENERATOR (FORMATTED)
+# 5. SIGNAL & FORMATTING (UPDATED)
 # =========================
-def generate_telegram_post(
-    coin, symbol_used, price, atr, side, 
-    lev_range, offset_pct, sl_mult, tp_mults, tp_percents
+def side_from_rsi(last_rsi: float, oversold: float, overbought: float):
+    if last_rsi < oversold: return "LONG"
+    if last_rsi > overbought: return "SHORT"
+    return None
+
+def build_trade_plan(
+    coin: str,
+    symbol_used: str,
+    last_price: float,
+    atr_value: float,
+    side: str,
+    lev_min: int,
+    lev_max: int,
+    limit_offset_pct: float,
+    sl_atr_mult: float,
+    tp_multipliers: list[float],
 ):
+    """
+    Генерує текст сигналу, ідентичний до прикладу.
+    """
+    # Очищаємо тікер (XLM/USDT -> XLM)
     base = coin.split("/")[0].split(":")[0]
-    
-    # Розрахунок входу
+
+    # Розрахунок цін входу
+    market_entry = last_price
     if side == "SHORT":
-        limit_entry = price * (1 + offset_pct)
-        emoji = "📈"
-        sl_price = ((price + limit_entry)/2) + (atr * sl_mult)
-        tps = [((price + limit_entry)/2) - (atr * m) for m in tp_mults]
+        limit_entry = last_price * (1 + limit_offset_pct) # Ліміт вище ринку для шорта
     else:
-        limit_entry = price * (1 - offset_pct)
-        emoji = "📉"
-        sl_price = ((price + limit_entry)/2) - (atr * sl_mult)
-        tps = [((price + limit_entry)/2) + (atr * m) for m in tp_mults]
+        limit_entry = last_price * (1 - limit_offset_pct) # Ліміт нижче ринку для лонга
 
-    entry_avg = (price + limit_entry) / 2
-    
-    # Розрахунок RR (Risk Reward) для останнього тейка
-    risk = abs(entry_avg - sl_price)
-    reward_max = abs(entry_avg - tps[-1])
-    rr_ratio = reward_max / risk if risk > 0 else 0
+    entry_avg = (market_entry + limit_entry) / 2.0
+    R = atr_value * sl_atr_mult
 
-    # Текст
-    lines = [
-        f"{base} {emoji} {side} x{lev_range[0]}-{lev_range[1]}",
-        "",
-        "✅ Вход: два ордера",
-        f"Рынок {fmt_price(symbol_used, price)}",
-        f"Лимит {fmt_price(symbol_used, limit_entry)}",
-        "",
-        "💸 Take-Profit:",
-    ]
-    
-    for i, tp in enumerate(tps):
-        pct = tp_percents[i] if i < len(tp_percents) else 0
-        lines.append(f"{i+1}) {fmt_price(symbol_used, tp)} (Fix {pct}%)")
-        
+    # Розрахунок SL та TP
+    if side == "SHORT":
+        stop = entry_avg + R
+        tps = [entry_avg - (R * m) for m in tp_multipliers]
+        header = f"{base} 📈 SHORT x{lev_min}-{lev_max}"
+    else:
+        stop = entry_avg - R
+        tps = [entry_avg + (R * m) for m in tp_multipliers]
+        header = f"{base} 📉 LONG x{lev_min}-{lev_max}"
+
+    # === ФОРМУВАННЯ ТЕКСТУ (СУВОРИЙ ФОРМАТ) ===
+    lines = []
+    lines.append(header)
+    lines.append("") # Порожній рядок
+    lines.append("✅ Вход: два ордера")
+    lines.append(f"Рынок {fmt_price(symbol_used, market_entry)}")
+    lines.append(f"Лимит {fmt_price(symbol_used, limit_entry)}")
     lines.append("")
-    lines.append(f"❌ Stop-loss: {fmt_price(symbol_used, sl_price)}")
-    lines.append(f"⚖️ RR: 1:{rr_ratio:.1f}")
+    lines.append("💸Take-Profit:") # Використовую Take-Profit як у стандарті
+    for i, tp in enumerate(tps, start=1):
+        lines.append(f"{i}) {fmt_price(symbol_used, tp)}")
+    lines.append("")
+    lines.append(f"❌Stop-loss: {fmt_price(symbol_used, stop)}")
 
     return "\n".join(lines)
+
+def style_side(val: str) -> str:
+    if val == "LONG": return "color: #00ff7f; font-weight: bold"
+    if val == "SHORT": return "color: #ff4d4d; font-weight: bold"
+    return "color: #cfcfcf"
 
 # =========================
 # 6. SIDEBAR UI
 # =========================
-st.sidebar.header("⚙️ Налаштування Сканера")
+st.sidebar.header("🔍 Налаштування")
+universe_mode = st.sidebar.radio(
+    "Джерело монет:",
+    ["Auto: Top Volume USDT", "Ручний список"],
+    index=0
+)
 
-# A. Universe
-with st.sidebar.expander("🌍 Вибір монет", expanded=False):
-    scan_mode = st.radio("Режим:", ["Auto Top-Volume", "Ручний"], index=0)
-    n_coins = st.slider("К-сть монет (Top Volume)", 10, 100, 40)
-    manual_coins = st.multiselect("Монети", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "PEPE/USDT"], default=["BTC/USDT"])
+st.sidebar.subheader("Логіка RSI")
+timeframe = st.sidebar.selectbox("Таймфрейм", ['5m', '15m', '1h', '4h'], index=1)
+rsi_period = st.sidebar.slider("Період RSI", 7, 21, 14)
+overbought = st.sidebar.number_input("RSI для SHORT (>)", value=70.0)
+oversold = st.sidebar.number_input("RSI для LONG (<)", value=30.0)
+limit_candles = 200
 
-# B. Strategy
-with st.sidebar.expander("📊 Стратегія (RSI & Trend)", expanded=True):
-    tf = st.selectbox("Таймфрейм", ["5m", "15m", "1h", "4h"], index=1)
-    rsi_len = st.number_input("RSI Period", 7, 21, 14)
-    ob_level = st.slider("Overbought (Short)", 60, 90, 70)
-    os_level = st.slider("Oversold (Long)", 10, 40, 30)
-    ema_len = st.number_input("EMA Trend Filter", 50, 200, 200)
+st.sidebar.subheader("Параметри Угоди")
+col_lev1, col_lev2 = st.sidebar.columns(2)
+lev_min = int(col_lev1.number_input("Плече мін", value=20))
+lev_max = int(col_lev2.number_input("Плече макс", value=25))
+limit_offset_pct = st.sidebar.slider("Відступ лімітки (%)", 0.1, 5.0, 2.0, 0.1) / 100.0
 
-# C. Risk Management
-with st.sidebar.expander("💰 Ризик Менеджмент", expanded=True):
-    lev_min = st.number_input("Плече Min", 10, 125, 20)
-    lev_max = st.number_input("Плече Max", 10, 125, 25)
-    limit_offset = st.slider("Відступ лімітки (%)", 0.0, 3.0, 1.5, step=0.1) / 100
-    sl_mult = st.slider("SL (x ATR)", 1.0, 5.0, 1.5, step=0.1)
-    
-    st.write("---")
-    st.write("**Налаштування Тейків (ATR Multiplier & % Exit)**")
-    c1, c2 = st.columns(2)
-    tp1_m = c1.number_input("TP1 xATR", 0.5, 5.0, 1.0)
-    tp1_p = c2.number_input("TP1 Закрити %", 0, 100, 50)
-    
-    c3, c4 = st.columns(2)
-    tp2_m = c3.number_input("TP2 xATR", 1.0, 10.0, 2.0)
-    tp2_p = c4.number_input("TP2 Закрити %", 0, 100, 30)
-    
-    c5, c6 = st.columns(2)
-    tp3_m = c5.number_input("TP3 xATR", 2.0, 20.0, 4.0)
-    tp3_p = c6.number_input("TP3 Закрити %", 0, 100, 20)
+atr_period = st.sidebar.slider("Період ATR", 7, 21, 14)
+sl_atr_mult = st.sidebar.slider("SL множник ATR", 0.5, 4.0, 1.5, 0.1)
+tp_mult_str = st.sidebar.text_input("TP множники (через кому)", value="1, 2, 3")
 
-    tp_mults = [tp1_m, tp2_m, tp3_m]
-    tp_percents = [tp1_p, tp2_p, tp3_p]
+# Парсинг множників TP
+try:
+    tp_multipliers = [float(x.strip()) for x in tp_mult_str.split(",") if x.strip()]
+except:
+    tp_multipliers = [1, 2, 3]
+
+if universe_mode.startswith("Auto"):
+    top_n = st.sidebar.slider("Скільки монет сканувати?", 10, 100, 30)
+    coins_universe = get_top_usdt_perp_symbols(top_n)
+    st.sidebar.success(f"Завантажено {len(coins_universe)} активних монет.")
+else:
+    coins_universe = st.sidebar.multiselect(
+        "Оберіть монети:",
+        ['BTC/USDT','ETH/USDT','SOL/USDT','XRP/USDT','BNB/USDT','DOGE/USDT','PEPE/USDT','APT/USDT'],
+        default=['BTC/USDT','ETH/USDT','SOL/USDT']
+    )
 
 # =========================
-# 7. MAIN LOGIC
+# 7. STATE & EXECUTION
 # =========================
-if st.button("🚀 СКАНУВАТИ РИНОК", type="primary"):
-    
-    # 1. Get Coins
-    with st.spinner("Завантаження списку монет та об'ємів..."):
-        if scan_mode.startswith("Auto"):
-            coins, changes_dict = get_top_usdt_perp_symbols(n_coins)
-        else:
-            coins = manual_coins
-            changes_dict = {}
+if "scan_data" not in st.session_state:
+    st.session_state.scan_data = None
+    st.session_state.trade_posts = []
+    st.session_state.scan_errors = []
 
-    # 2. Analyze
-    results = []
-    posts = []
+def analyze_market(coins):
+    rows = []
     errors = []
     
-    prog_bar = st.progress(0)
-    status_text = st.empty()
+    progress_bar = st.progress(0)
     
-    for i, coin in enumerate(coins):
-        status_text.text(f"Аналіз {coin}...")
-        # Більший ліміт свічок для коректної EMA 200
-        df, err = fetch_ohlcv_cached(coin, tf, lim=ema_len + 100) 
-        
-        if df is None:
-            errors.append(f"{coin}: {err}")
+    for idx, coin in enumerate(coins):
+        df, err = fetch_ohlcv_cached(coin, timeframe, limit_candles)
+        if df is None or df.empty:
+            errors.append((coin, err))
             continue
             
-        df = calculate_indicators(df, rsi_len, 14, ema_len)
+        df["rsi"] = rsi_series(df["close"], rsi_period)
+        df["atr"] = atr_series(df, atr_period)
         
-        last = df.iloc[-1]
-        side, trend, warning = get_signal(last, os_level, ob_level)
+        last_price = float(df["close"].iloc[-1])
+        last_rsi = float(df["rsi"].iloc[-1])
+        last_atr = float(df["atr"].iloc[-1])
+        sym_used = df["symbol_used"].iloc[-1]
         
-        chg_24h = changes_dict.get(coin, 0)
+        side = side_from_rsi(last_rsi, oversold, overbought)
         
-        # Записуємо результат
-        res_row = {
+        rows.append({
             "Coin": coin,
-            "Price": last["close"],
-            "24h%": chg_24h,
-            "RSI": last["rsi"],
-            "Trend": trend,
-            "Signal": side if side else "-",
-            "Warning": warning,
-            "ATR": last["atr"],
-            "SymbolUsed": last["symbol_used"]
-        }
-        results.append(res_row)
+            "Price": last_price,
+            "RSI": last_rsi,
+            "ATR": last_atr,
+            "Side": side if side else "-",
+            "SymbolUsed": sym_used
+        })
+        progress_bar.progress((idx + 1) / len(coins))
         
-        # Якщо є сигнал - робимо пост
-        if side:
-            post = generate_telegram_post(
-                coin, res_row["SymbolUsed"], last["close"], last["atr"], side,
-                (lev_min, lev_max), limit_offset, sl_mult, tp_mults, tp_percents
-            )
-            posts.append(post)
-            
-        prog_bar.progress((i+1)/len(coins))
+    progress_bar.empty()
     
-    prog_bar.empty()
-    status_text.empty()
-    
-    # 3. Show Results
-    df_res = pd.DataFrame(results)
-    
-    if not df_res.empty:
-        # Sort: Signals first, then by RSI deviation from 50
-        df_res["_sort"] = df_res["Signal"].apply(lambda x: 0 if x in ["LONG", "SHORT"] else 1)
-        df_res["_rsi_dev"] = abs(df_res["RSI"] - 50)
-        df_res = df_res.sort_values(["_sort", "_rsi_dev"], ascending=[True, False]).drop(columns=["_sort", "_rsi_dev"])
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        # Сортуємо: спочатку сигнали, потім решта
+        out["_sort"] = out["Side"].apply(lambda x: 0 if x in ["LONG", "SHORT"] else 1)
+        out = out.sort_values(["_sort", "Coin"]).drop(columns=["_sort"])
+    return out, errors
 
-        # Tabs
-        t1, t2, t3 = st.tabs(["📋 Аналіз ринку", "📢 Готові сигнали", "📉 Графік"])
+# Кнопка запуску
+if st.button("🚀 СКАНУВАТИ РИНОК", type="primary"):
+    with st.spinner("Аналізую ринок..."):
+        data, errs = analyze_market(coins_universe)
         
-        with t1:
-            st.subheader("Зведена таблиця")
-            
-            def color_rows(val):
-                if val == "LONG": return "color: #00ff00; font-weight: bold"
-                if val == "SHORT": return "color: #ff0000; font-weight: bold"
-                return ""
-                
-            st.dataframe(
-                df_res.style.map(color_rows, subset=["Signal"])
-                .format({"Price": "{:.4f}", "24h%": "{:+.2f}%", "RSI": "{:.1f}", "ATR": "{:.5f}"}),
-                use_container_width=True,
-                height=600
-            )
-            
-        with t2:
-            st.subheader(f"Знайдено сигналів: {len(posts)}")
-            if posts:
-                cols = st.columns(2)
-                for idx, p in enumerate(posts):
-                    with cols[idx % 2]:
-                        st.text_area(f"Signal {idx+1}", p, height=350)
-            else:
-                st.info("Сигналів немає. Ринок у флеті або RSI в нормі.")
+        # Генерація постів
+        posts = []
+        if not data.empty:
+            signals = data[data["Side"].isin(["LONG", "SHORT"])]
+            for _, row in signals.iterrows():
+                post_text = build_trade_plan(
+                    coin=row["Coin"],
+                    symbol_used=row["SymbolUsed"],
+                    last_price=row["Price"],
+                    atr_value=row["ATR"],
+                    side=row["Side"],
+                    lev_min=lev_min,
+                    lev_max=lev_max,
+                    limit_offset_pct=limit_offset_pct,
+                    sl_atr_mult=sl_atr_mult,
+                    tp_multipliers=tp_multipliers
+                )
+                posts.append(post_text)
 
-        with t3:
-            coin_sel = st.selectbox("Перевірити графік:", df_res["Coin"].unique())
-            if coin_sel:
-                row = df_res[df_res["Coin"] == coin_sel].iloc[0]
-                # Re-fetch for clean plotting
-                df_p, _ = fetch_ohlcv_cached(coin_sel, tf, ema_len+100)
-                df_p = calculate_indicators(df_p, rsi_len, 14, ema_len)
+        st.session_state.scan_data = data
+        st.session_state.scan_errors = errs
+        st.session_state.trade_posts = posts
+
+# =========================
+# 8. OUTPUT DISPLAY
+# =========================
+data = st.session_state.scan_data
+
+if data is not None:
+    tab1, tab2, tab3 = st.tabs(["📋 Таблиця", "📢 Сигнали (Copy-Paste)", "📈 Графік"])
+    
+    with tab1:
+        st.subheader(f"Результати ({len(data)} монет)")
+        
+        # Виділяємо кольором LONG/SHORT
+        styled_df = data.style.map(style_side, subset=["Side"]).format({
+            "Price": "{:.5f}", 
+            "RSI": "{:.1f}", 
+            "ATR": "{:.5f}"
+        })
+        st.dataframe(styled_df, use_container_width=True, height=600)
+        
+        if st.session_state.scan_errors:
+            with st.expander("Помилки завантаження"):
+                st.write(st.session_state.scan_errors)
+
+    with tab2:
+        st.subheader("Готові пости для Telegram")
+        if not st.session_state.trade_posts:
+            st.info("Наразі сигналів немає (RSI в межах норми). Спробуйте змінити налаштування RSI.")
+        else:
+            cols = st.columns(2)
+            for i, post in enumerate(st.session_state.trade_posts):
+                with cols[i % 2]:
+                    st.text_area(f"Сигнал #{i+1}", post, height=300)
+                    st.button(f"Копіювати #{i+1}", disabled=True, help="Виділіть текст вище та скопіюйте")
+
+    with tab3:
+        st.subheader("Перевірка на графіку")
+        coin_list = data["Coin"].tolist()
+        coin_sel = st.selectbox("Оберіть монету", coin_list)
+        
+        if coin_sel:
+            df_chart, _ = fetch_ohlcv_cached(coin_sel, timeframe, limit_candles)
+            if df_chart is not None:
+                df_chart["rsi"] = rsi_series(df_chart["close"], rsi_period)
                 
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
+                fig.add_trace(go.Candlestick(x=df_chart["timestamp"], open=df_chart["open"], high=df_chart["high"],
+                                             low=df_chart["low"], close=df_chart["close"], name="Price"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_chart["timestamp"], y=df_chart["rsi"], name="RSI", line=dict(color='purple')), row=2, col=1)
                 
-                # Candlesticks
-                fig.add_trace(go.Candlestick(
-                    x=df_p["timestamp"], open=df_p["open"], high=df_p["high"],
-                    low=df_p["low"], close=df_p["close"], name="Price"
-                ), row=1, col=1)
+                fig.add_hline(y=overbought, line_dash="dash", line_color="red", row=2, col=1)
+                fig.add_hline(y=oversold, line_dash="dash", line_color="green", row=2, col=1)
                 
-                # EMA
-                fig.add_trace(go.Scatter(x=df_p["timestamp"], y=df_p["ema"], name=f"EMA {ema_len}", line=dict(color='orange')), row=1, col=1)
-                
-                # RSI
-                fig.add_trace(go.Scatter(x=df_p["timestamp"], y=df_p["rsi"], name="RSI", line=dict(color='purple')), row=2, col=1)
-                fig.add_hline(y=ob_level, line_color="red", row=2, col=1)
-                fig.add_hline(y=os_level, line_color="green", row=2, col=1)
-                
-                fig.update_layout(height=600, template="plotly_dark", title=f"{coin_sel} ({tf}) Analysis")
+                fig.update_layout(height=600, template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
                 st.plotly_chart(fig, use_container_width=True)
-
 else:
-    st.info("👈 Налаштуйте параметри зліва та натисніть 'Сканувати'")
+    st.info("Натисніть кнопку **СКАНУВАТИ РИНОК** зліва або зверху.")
