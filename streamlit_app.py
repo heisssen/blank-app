@@ -2,18 +2,16 @@ import streamlit as st
 import ccxt
 import pandas as pd
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from concurrent.futures import ThreadPoolExecutor
 
 # =========================
 # 1. CONFIG & STYLES
 # =========================
-st.set_page_config(page_title="Crypto 5-Exchange Sniper Pro", layout="wide", page_icon="🌐")
+st.set_page_config(page_title="Crypto Multi-Exchange Sniper Pro", layout="wide", page_icon="🌐")
 
 st.markdown("""
 <style>
-    /* ... (CSS стилі без змін для мобільної адаптації) ... */
     .stDataFrame {font-size: 14px;}
     div[data-testid="stMetricValue"] {font-size: 16px !important;}
     .mobile-card {
@@ -30,13 +28,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🌐 Crypto 5-Exchange Sniper Pro V4")
-st.markdown("Сканер RSI + Trend Filter для **Binance, Bybit, KuCoin, OKX, Kraken**.")
+st.title("🌐 Multi-Exchange Sniper Pro V3")
+st.markdown("Сканер RSI + Trend Filter для **Binance, Bybit, KuCoin**.")
 
 # =========================
 # 2. CORE FUNCTIONS
 # =========================
 def fmt_price(price: float) -> str:
+    """Розумне форматування ціни"""
     if price >= 1000: return f"{price:.1f}"
     if price >= 10: return f"{price:.2f}"
     if price >= 1: return f"{price:.4f}"
@@ -45,12 +44,11 @@ def fmt_price(price: float) -> str:
 # =========================
 # 3. DATA ENGINE (UNIVERSAL)
 # =========================
+# ccxt.Exchange - це клас, який не можна кешувати напряму, тому використовуємо ccxt.exchanges
 EXCHANGE_CLASSES = {
     'binance': ccxt.binance,
     'bybit': ccxt.bybit,
     'kucoin': ccxt.kucoin,
-    'okx': ccxt.okx,      # Додано OKX
-    'kraken': ccxt.kraken, # Додано Kraken
 }
 
 @st.cache_resource
@@ -59,57 +57,53 @@ def get_exchange(exchange_id: str):
     if not ExClass:
         raise ValueError(f"Exchange {exchange_id} not supported.")
     
+    # Спільні налаштування
     config = {
         "enableRateLimit": True,
-        "options": {"defaultType": "future"}, # Default для ф'ючерсів
+        "options": {"defaultType": "future"},
     }
     
-    if exchange_id == 'kraken':
-        # Kraken Futures може мати інший endpoint
+    # Якщо потрібно, можна додати специфічні опції тут
+    if exchange_id == 'binance':
+        # Binance часто потребує defaultType='future' для ф'ючерсів
         config["options"]["defaultType"] = "future"
-        # CCXT може потребувати окремий ID для Kraken Futures, але спробуємо так
+    elif exchange_id == 'bybit':
+        # Bybit не потребує додаткових опцій для ф'ючерсів
+        config.pop("options", None) 
+    elif exchange_id == 'kucoin':
+        # KuCoin також добре працює з defaultType='future'
+        config["options"]["defaultType"] = "future"
     
     return ExClass(config)
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_top_usdt_perp_symbols(exchange_id: str, top_n: int):
     ex = get_exchange(exchange_id)
-    fallback = ["BTC/USDT", "ETH/USDT"] 
+    fallback = ["BTC/USDT", "ETH/USDT"] # Спрощений fallback
     
     try:
         markets = ex.load_markets()
         active_perps = []
         
-        # УНІВЕРСАЛЬНА ЛОГІКА ФІЛЬТРУ
+        # УНІВЕРСАЛЬНА ЛОГІКА ФІЛЬТРУ (АДАПТОВАНО)
         for s, m in markets.items():
-            # Базовий фільтр
-            if not m.get('active') or m.get('quote') != 'USDT':
-                continue
-                
-            # Специфічні фільтри для ф'ючерсів / безстрокових контрактів
-            if exchange_id == 'binance' and m.get('swap') and m.get('linear'):
-                active_perps.append(s)
-            elif exchange_id == 'bybit' and m.get('linear') is True and 'PERP' in s:
-                active_perps.append(s)
-            elif exchange_id == 'kucoin' and m.get('type') == 'future':
-                active_perps.append(s)
-            elif exchange_id == 'okx' and m.get('swap') and 'SWAP' in s: # OKX використовує 'SWAP'
-                 active_perps.append(s)
-            elif exchange_id == 'kraken' and m.get('type') == 'future':
-                 active_perps.append(s)
-            # Якщо біржа не підтримує USDT ф'ючерси, тут може бути порожньо
+            if m.get('active') and m.get('quote') == 'USDT':
+                # Фільтруємо безстрокові контракти USDT
+                if exchange_id == 'binance' and m.get('swap') and m.get('linear'):
+                    active_perps.append(s)
+                elif exchange_id == 'bybit' and m.get('linear') is True and 'PERP' in s: # Bybit має linear=True
+                    active_perps.append(s)
+                elif exchange_id == 'kucoin' and m.get('type') == 'future': # KuCoin має type='future'
+                    active_perps.append(s)
         
         if not active_perps:
-            # Спробуємо ще раз, використовуючи лише Spot, якщо ф'ючерсів немає (наприклад, для Kraken)
-            active_perps = [s for s, m in markets.items() if m.get('active') and m.get('quote') == 'USDT' and m.get('type') == 'spot']
-            if not active_perps:
-                st.warning(f"No perpetual or spot USDT markets found on {exchange_id}. Using fallback.")
-                return fallback, {}
-            
+            st.warning(f"No active perpetual USDT markets found on {exchange_id}. Using fallback.")
+            return fallback, {}
+
         tickers = ex.fetch_tickers(active_perps)
         scored = []
         for s, t in tickers.items():
-            vol = t.get('quoteVolume', 0) or t.get('volume', 0) 
+            vol = t.get('quoteVolume', 0) or t.get('volume', 0) # ccxt уніфікація
             change_24h = t.get('percentage', 0) or 0
             scored.append((s, vol, change_24h))
         
@@ -119,7 +113,6 @@ def get_top_usdt_perp_symbols(exchange_id: str, top_n: int):
         changes_dict = {x[0]: x[2] for x in scored[:top_n]}
         return top_coins, changes_dict
     except Exception as e:
-        # Kraken може видавати помилку, якщо не налаштовано environment
         st.error(f"Error fetching symbols from {exchange_id}: {e}")
         return fallback, {}
 
@@ -129,6 +122,7 @@ def fetch_single_coin(args):
     ExClass = EXCHANGE_CLASSES.get(exchange_id)
     if not ExClass: return symbol, None, "Invalid exchange ID"
     
+    # Створюємо інстанс біржі для потоку
     ex = ExClass(ex_config)
     
     try:
@@ -145,6 +139,7 @@ def fetch_single_coin(args):
 # 4. INDICATORS & LOGIC (БЕЗ ЗМІН)
 # =========================
 def calculate_indicators(df, rsi_per=14, atr_per=14, ema_per=200):
+    # ... (функція calculate_indicators без змін) ...
     if df is None or len(df) < ema_per: return df
     
     delta = df["close"].diff()
@@ -165,6 +160,7 @@ def calculate_indicators(df, rsi_per=14, atr_per=14, ema_per=200):
     return df
 
 def get_signal(row, oversold, overbought):
+    # ... (функція get_signal без змін) ...
     rsi = row["rsi"]
     price = row["close"]
     ema = row["ema"]
@@ -184,6 +180,7 @@ def get_signal(row, oversold, overbought):
     return signal, trend, warning
 
 def generate_telegram_post(coin, price, atr, side, lev_range, offset_pct, sl_mult, tp_mults, tp_percents, exchange_id):
+    # Додаємо біржу до посту
     base = coin.split("/")[0]
     
     if side == "SHORT":
@@ -220,20 +217,21 @@ def generate_telegram_post(coin, price, atr, side, lev_range, offset_pct, sl_mul
 # =========================
 st.sidebar.header("⚙️ Scanner Config")
 
-# A. Exchange Selection (UPDATED)
+# A. Exchange Selection (NEW!)
 with st.sidebar.expander("🌐 Вибір Біржі", expanded=True):
     exchange_id = st.selectbox(
         "Біржа:",
-        options=["kucoin", "okx", "bybit", "binance", "kraken"],
+        options=["kucoin", "bybit", "binance"],
         index=0,
         format_func=lambda x: x.upper()
     )
-    st.markdown("> **KuCoin/OKX:** Найкраще для Streamlit Cloud (США).")
+    st.markdown(f"> **KuCoin:** Рекомендовано для Streamlit Cloud (США) / **Binance, Bybit:** Краще з VPN/EU/UA IP.")
     
 # B. Universe
 with st.sidebar.expander("🌍 Вибір монет", expanded=False):
     scan_mode = st.radio("Режим:", ["Auto Top-Volume", "Ручний"], index=0)
     n_coins = st.slider("К-сть монет (Top Volume)", 10, 50, 20)
+    # Ручний список має бути універсальним
     manual_coins = st.multiselect("Монети", ["BTC/USDT", "ETH/USDT", "SOL/USDT"], default=["BTC/USDT"])
 
 # C. Strategy
@@ -267,18 +265,19 @@ if start_btn:
     changes = {}
     
     with st.spinner(f"Завантаження списку монет з {exchange_id.upper()}..."):
-        coins, changes = get_top_usdt_perp_symbols(exchange_id, n_coins)
-        if scan_mode == "Ручний" and manual_coins:
+        if scan_mode.startswith("Auto"):
+            coins, changes = get_top_usdt_perp_symbols(exchange_id, n_coins)
+        else:
             coins = manual_coins
 
     status_bar = st.progress(0)
     results = []
     
     # Конфігурація біржі для потоків
-    # Ми беремо конфіг з кешованого об'єкта
-    base_ex = get_exchange(exchange_id)
-    ex_conf = {"enableRateLimit": True, "options": base_ex.options}
+    base_ex_config = get_exchange(exchange_id).options
+    ex_conf = {"enableRateLimit": True, "options": base_ex_config}
     
+    # Створюємо завдання для потоків: (символ, ТФ, ліміт, ID біржі, конфіг)
     tasks = [(c, tf, ema_len+50, exchange_id, ex_conf) for c in coins]
     
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -287,58 +286,44 @@ if start_btn:
             processed_count += 1
             status_bar.progress(processed_count / len(coins))
             
-            # Якщо виникла помилка під час fetch, записуємо нульові дані
-            if df is None or df.empty:
+            if df is not None and not df.empty:
+                df = calculate_indicators(df, rsi_len, 14, ema_len)
+                last = df.iloc[-1]
+                
+                sig, trnd, warn = get_signal(last, os_level, ob_level)
+                
+                post_txt = ""
+                if sig:
+                    post_txt = generate_telegram_post(
+                        symbol, last["close"], last["atr"], sig, 
+                        lev_range, limit_offset, sl_mult, tp_setup, tp_pcts, exchange_id
+                    )
+
                 results.append({
                     "Coin": symbol,
-                    "Price": 0.0,
-                    "RSI": 50.0,
-                    "Trend": "N/A",
-                    "Signal": "Error",
-                    "Warning": f"Data Error ({err})",
-                    "Post": "",
-                    "24h%": 0.0
+                    "Price": last["close"],
+                    "RSI": last["rsi"],
+                    "Trend": trnd,
+                    "Signal": sig,
+                    "Warning": warn,
+                    "Post": post_txt,
+                    "24h%": changes.get(symbol, 0)
                 })
-                continue
-                
-            df = calculate_indicators(df, rsi_len, 14, ema_len)
-            last = df.iloc[-1]
-            
-            sig, trnd, warn = get_signal(last, os_level, ob_level)
-            
-            post_txt = ""
-            if sig:
-                post_txt = generate_telegram_post(
-                    symbol, last["close"], last["atr"], sig, 
-                    lev_range, limit_offset, sl_mult, tp_setup, tp_pcts, exchange_id
-                )
-
-            results.append({
-                "Coin": symbol,
-                "Price": last["close"],
-                "RSI": last["rsi"],
-                "Trend": trnd,
-                "Signal": sig,
-                "Warning": warn,
-                "Post": post_txt,
-                "24h%": changes.get(symbol, 0)
-            })
 
     status_bar.empty()
     
     df_res = pd.DataFrame(results)
     
     if not df_res.empty:
-        # Сортування: Сигнали спочатку, потім за відхиленням RSI від 50
+        # Сортування
         df_res["_sort"] = df_res["Signal"].apply(lambda x: 0 if x else 1)
-        df_res["_rsi_dev"] = abs(df_res["RSI"] - 50)
-        df_res = df_res.sort_values(["_sort", "_rsi_dev"], ascending=[True, False]).drop(columns=["_sort", "_rsi_dev"])
+        df_res = df_res.sort_values(["_sort", "RSI"], ascending=True)
 
-        tab1, tab2, tab3 = st.tabs(["📱 Сигнали", "📊 Зведена таблиця", "📈 Графік"])
+        tab1, tab2 = st.tabs(["📱 Сигнали (Mobile)", "📊 Таблиця (Desktop)"])
         
-        # --- TAB 1: MOBILE CARDS (Тільки сигнали) ---
+        # --- TAB 1: MOBILE CARDS ---
         with tab1:
-            signals_only = df_res[df_res["Signal"].notna() & (df_res["Signal"] != "Error")]
+            signals_only = df_res[df_res["Signal"].notna()]
             
             if signals_only.empty:
                 st.warning(f"No active signals found on {exchange_id.upper()} right now.")
@@ -365,20 +350,10 @@ if start_btn:
                         st.code(row["Post"], language="text")
                         st.divider()
 
-        # --- TAB 2: ADVANCED TABLE (ВСІ монети) ---
+        # --- TAB 2: ADVANCED TABLE ---
         with tab2:
-            st.subheader(f"Результати сканування: {len(df_res)} монет")
-            
-            # Функція для фарбування рядків таблиці
-            def color_rows(val):
-                if val == "LONG": return "background-color: #1e3a2f; color: white; font-weight: bold"
-                if val == "SHORT": return "background-color: #3a1e1e; color: white; font-weight: bold"
-                if val == "Error": return "background-color: #58411d; color: yellow; font-weight: bold"
-                return ""
-            
             st.dataframe(
-                df_res.style.applymap(color_rows, subset=["Signal"]) # Фарбуємо стовпець Signal
-                .format({"Price": "{:.4f}", "24h%": "{:+.2f}%", "RSI": "{:.1f}"}),
+                df_res.style.apply(lambda x: ['background-color: #1e3a2f' if x.Signal == 'LONG' else ('background-color: #3a1e1e' if x.Signal == 'SHORT' else '') for i in x], axis=1),
                 column_config={
                     "RSI": st.column_config.ProgressColumn("RSI", format="%.1f", min_value=0, max_value=100),
                     "Price": st.column_config.NumberColumn(format="%.4f"),
@@ -389,40 +364,5 @@ if start_btn:
                 hide_index=True,
                 column_order=["Coin", "Price", "24h%", "RSI", "Signal", "Trend", "Warning"]
             )
-
-        # --- TAB 3: GRAPH (Графік) ---
-        with tab3:
-            # Фільтруємо монети без помилок для вибору графіку
-            valid_coins = df_res[df_res["Signal"] != "Error"]["Coin"].unique()
-            if valid_coins.size > 0:
-                coin_sel = st.selectbox("Перевірити графік:", valid_coins)
-                
-                # Повторний fetch для clean plotting
-                df_p, _ = fetch_single_coin((coin_sel, tf, ema_len+100, exchange_id, ex_conf))
-                if df_p is not None:
-                    df_p = calculate_indicators(df_p, rsi_len, 14, ema_len)
-                    
-                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-                    
-                    # Candlesticks
-                    fig.add_trace(go.Candlestick(
-                        x=df_p["timestamp"], open=df_p["open"], high=df_p["high"],
-                        low=df_p["low"], close=df_p["close"], name="Price"
-                    ), row=1, col=1)
-                    
-                    # EMA
-                    fig.add_trace(go.Scatter(x=df_p["timestamp"], y=df_p["ema"], name=f"EMA {ema_len}", line=dict(color='orange')), row=1, col=1)
-                    
-                    # RSI
-                    fig.add_trace(go.Scatter(x=df_p["timestamp"], y=df_p["rsi"], name="RSI", line=dict(color='purple')), row=2, col=1)
-                    fig.add_hline(y=ob_level, line_color="red", row=2, col=1)
-                    fig.add_hline(y=os_level, line_color="green", row=2, col=1)
-                    
-                    fig.update_layout(height=600, template="plotly_dark", title=f"{coin_sel} ({tf}) Analysis on {exchange_id.upper()}")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.warning("Неможливо завантажити дані для графіку.")
-            else:
-                st.warning("Немає доступних монет для графіку.")
     else:
-        st.error(f"Не вдалося отримати дані. Перевірте підключення до {exchange_id.upper()}.")
+        st.error(f"Не вдалося отримати дані. Перевірте підключення до {exchange_id.upper()} та обмеження IP-адреси.")
