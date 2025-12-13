@@ -8,8 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 # =========================
 # 1. CONFIG & STYLES
 # =========================
-st.set_page_config(page_title="Bybit Sniper Pro", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="KuCoin Sniper Pro", layout="wide", page_icon="⚡")
 
+# Custom CSS залишаємо для мобільної оптимізації
 st.markdown("""
 <style>
     .stDataFrame {font-size: 14px;}
@@ -28,72 +29,73 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ Bybit Sniper Pro: Mobile Edition")
+st.title("⚡ KuCoin Sniper Pro: Streamlit Edition")
+st.markdown("✅ Оптимізовано для роботи на серверах у США (KuCoin API)")
 
 # =========================
-# 2. CORE FUNCTIONS (BYBIT VERSION)
+# 2. CORE FUNCTIONS (KUCOIN VERSION)
 # =========================
 @st.cache_resource
 def get_exchange():
-    return ccxt.bybit({
+    # Використовуємо KuCoin, який менш схильний до блокування IP США для публічних даних
+    return ccxt.kucoin({
         "enableRateLimit": True,
-        # Bybit не потребує 'defaultType': 'future' в опціях так суворо як Binance,
-        # але ми будемо фільтрувати ринки вручну.
+        "options": {"defaultType": "future"}, # Вказуємо на ф'ючерси
     })
 
 def fmt_price(price: float) -> str:
+    """Розумне форматування ціни"""
     if price >= 1000: return f"{price:.1f}"
     if price >= 10: return f"{price:.2f}"
     if price >= 1: return f"{price:.4f}"
     return f"{price:.6f}"
 
 # =========================
-# 3. DATA ENGINE (BYBIT ADAPTED)
+# 3. DATA ENGINE (KUCOIN ADAPTED)
 # =========================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_top_usdt_perp_symbols(top_n: int):
     ex = get_exchange()
-    # Запасний список у форматі Bybit
-    fallback = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT"]
+    # KuCoin використовує формат 'BTC-USDT' або 'XBTUSDTM' для ф'ючерсів
+    fallback = ["BTC/USDT", "ETH/USDT", "SOL/USDT"] 
     
     try:
         markets = ex.load_markets()
         
-        # Фільтр для Bybit USDT Perpetual (Linear)
-        # linear=True означає безстрокові контракти USDT
+        # Фільтруємо для USDT Perpetual (Futures) на KuCoin
         active_perps = [
             s for s, m in markets.items() 
-            if m.get('linear') is True 
+            if m.get('type') == 'future' 
             and m.get('quote') == 'USDT' 
             and m.get('active')
         ]
         
-        # Якщо список порожній (іноді буває через кеш ccxt), беремо fallback
         if not active_perps:
             return fallback, {}
 
-        # Отримуємо тікери
         tickers = ex.fetch_tickers(active_perps)
         scored = []
         for s, t in tickers.items():
-            vol = t.get('quoteVolume', 0) or 0
+            # KuCoin використовує 'baseVolume', 'quoteVolume' або 'volume'
+            vol = t.get('quoteVolume', 0) or t.get('volume', 0)
             change_24h = t.get('percentage', 0) or 0
             scored.append((s, vol, change_24h))
         
-        # Сортуємо за об'ємом
         scored.sort(key=lambda x: x[1], reverse=True)
         
         top_coins = [x[0] for x in scored[:top_n]]
         changes_dict = {x[0]: x[2] for x in scored[:top_n]}
         return top_coins, changes_dict
     except Exception as e:
-        st.error(f"Error fetching symbols: {e}")
+        st.error(f"Error fetching symbols from KuCoin: {e}")
         return fallback, {}
 
 def fetch_single_coin(args):
     """Worker function for threading"""
     symbol, tf, lim, ex_config = args
-    ex = ccxt.bybit(ex_config)
+    # Для ф'ючерсів KuCoin потрібен окремий синтаксис, ccxt це обробляє через defaultType: 'future'
+    ex = ccxt.kucoin(ex_config) 
+    
     try:
         bars = ex.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
         if not bars:
@@ -106,7 +108,7 @@ def fetch_single_coin(args):
         return symbol, None, str(e)
 
 # =========================
-# 4. LOGIC (STANDARD)
+# 4. LOGIC (БЕЗ ЗМІН)
 # =========================
 def calculate_indicators(df, rsi_per=14, atr_per=14, ema_per=200):
     if df is None or len(df) < ema_per: return df
@@ -151,7 +153,6 @@ def get_signal(row, oversold, overbought):
     return signal, trend, warning
 
 def generate_telegram_post(coin, price, atr, side, lev_range, offset_pct, sl_mult, tp_mults, tp_percents):
-    # Очищення назви (Bybit часто дає BTC/USDT:USDT -> залишаємо BTC)
     base = coin.split("/")[0]
     
     if side == "SHORT":
@@ -186,13 +187,12 @@ def generate_telegram_post(coin, price, atr, side, lev_range, offset_pct, sl_mul
 # =========================
 # 5. SIDEBAR
 # =========================
-st.sidebar.header("⚙️ Bybit Scanner Config")
+st.sidebar.header("⚙️ KuCoin Scanner Config")
 
 with st.sidebar.expander("🌍 Coins & Mode", expanded=False):
     scan_mode = st.radio("Mode:", ["Auto Top-Volume", "Manual"], index=0)
     n_coins = st.slider("Coins count", 10, 50, 20)
-    # Ручний вибір у форматі Bybit
-    manual_coins = st.multiselect("Manual list", ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"], default=["BTC/USDT:USDT"])
+    manual_coins = st.multiselect("Manual list", ["BTC/USDT", "ETH/USDT", "SOL/USDT"], default=["BTC/USDT"])
 
 with st.sidebar.expander("📊 Strategy", expanded=False):
     tf = st.selectbox("Timeframe", ["5m", "15m", "1h", "4h"], index=1)
@@ -202,7 +202,7 @@ with st.sidebar.expander("📊 Strategy", expanded=False):
     ema_len = st.number_input("EMA Trend", 50, 200, 200)
 
 with st.sidebar.expander("💰 Risk Manager", expanded=False):
-    lev_range = (10, 20) # На Bybit плечі часто менші за дефолтом
+    lev_range = (10, 20) 
     limit_offset = st.slider("Limit Offset %", 0.0, 3.0, 1.0) / 100
     sl_mult = st.slider("SL xATR", 1.0, 4.0, 2.0)
     tp_setup = [1.0, 2.5, 4.0] 
@@ -213,15 +213,15 @@ with st.sidebar.expander("💰 Risk Manager", expanded=False):
 # =========================
 col_act1, col_act2 = st.columns([3, 1])
 with col_act1:
-    st.info("💡 Bybit API зазвичай працює стабільніше. Використовуйте горизонтальну прокрутку для таблиць.")
+    st.info("💡 Використовуйте горизонтальну прокрутку для таблиць або вкладку 'Сигнали' для карток.")
 with col_act2:
-    start_btn = st.button("🚀 SCAN BYBIT", type="primary")
+    start_btn = st.button("🚀 SCAN KUCOIN", type="primary")
 
 if start_btn:
     coins = []
     changes = {}
     
-    with st.spinner("Fetching Bybit markets..."):
+    with st.spinner("Fetching KuCoin markets..."):
         if scan_mode.startswith("Auto"):
             coins, changes = get_top_usdt_perp_symbols(n_coins)
         else:
@@ -231,7 +231,7 @@ if start_btn:
     results = []
     
     # Threading setup
-    ex_conf = {"enableRateLimit": True}
+    ex_conf = {"enableRateLimit": True, "options": {"defaultType": "future"}}
     tasks = [(c, tf, ema_len+50, ex_conf) for c in coins]
     
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -254,7 +254,7 @@ if start_btn:
                     )
 
                 results.append({
-                    "Coin": symbol.replace("/USDT:USDT", ""), # Скорочуємо назву для краси
+                    "Coin": symbol,
                     "Price": last["close"],
                     "RSI": last["rsi"],
                     "Trend": trnd,
@@ -316,4 +316,4 @@ if start_btn:
                 column_order=["Coin", "Price", "24h%", "RSI", "Signal", "Trend", "Warning"]
             )
     else:
-        st.error("Дані не отримані. Можливо, ваш IP (США) заблокований і на Bybit. Спробуйте VPN (Польща/Україна).")
+        st.error("Дані не отримані. Перевірте підключення до KuCoin API.")
