@@ -1,4 +1,4 @@
-import streamlit as st
+'import streamlit as st
 import ccxt
 import pandas as pd
 import numpy as np
@@ -8,9 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 # =========================
 # 1. CONFIG & STYLES
 # =========================
-st.set_page_config(page_title="KuCoin Sniper Pro", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="Crypto Multi-Exchange Sniper Pro", layout="wide", page_icon="🌐")
 
-# Custom CSS залишаємо для мобільної оптимізації
 st.markdown("""
 <style>
     .stDataFrame {font-size: 14px;}
@@ -29,20 +28,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ KuCoin Sniper Pro: Streamlit Edition")
-st.markdown("✅ Оптимізовано для роботи на серверах у США (KuCoin API)")
+st.title("🌐 Multi-Exchange Sniper Pro V3")
+st.markdown("Сканер RSI + Trend Filter для **Binance, Bybit, KuCoin**.")
 
 # =========================
-# 2. CORE FUNCTIONS (KUCOIN VERSION)
+# 2. CORE FUNCTIONS
 # =========================
-@st.cache_resource
-def get_exchange():
-    # Використовуємо KuCoin, який менш схильний до блокування IP США для публічних даних
-    return ccxt.kucoin({
-        "enableRateLimit": True,
-        "options": {"defaultType": "future"}, # Вказуємо на ф'ючерси
-    })
-
 def fmt_price(price: float) -> str:
     """Розумне форматування ціни"""
     if price >= 1000: return f"{price:.1f}"
@@ -51,33 +42,68 @@ def fmt_price(price: float) -> str:
     return f"{price:.6f}"
 
 # =========================
-# 3. DATA ENGINE (KUCOIN ADAPTED)
+# 3. DATA ENGINE (UNIVERSAL)
 # =========================
+# ccxt.Exchange - це клас, який не можна кешувати напряму, тому використовуємо ccxt.exchanges
+EXCHANGE_CLASSES = {
+    'binance': ccxt.binance,
+    'bybit': ccxt.bybit,
+    'kucoin': ccxt.kucoin,
+}
+
+@st.cache_resource
+def get_exchange(exchange_id: str):
+    ExClass = EXCHANGE_CLASSES.get(exchange_id)
+    if not ExClass:
+        raise ValueError(f"Exchange {exchange_id} not supported.")
+    
+    # Спільні налаштування
+    config = {
+        "enableRateLimit": True,
+        "options": {"defaultType": "future"},
+    }
+    
+    # Якщо потрібно, можна додати специфічні опції тут
+    if exchange_id == 'binance':
+        # Binance часто потребує defaultType='future' для ф'ючерсів
+        config["options"]["defaultType"] = "future"
+    elif exchange_id == 'bybit':
+        # Bybit не потребує додаткових опцій для ф'ючерсів
+        config.pop("options", None) 
+    elif exchange_id == 'kucoin':
+        # KuCoin також добре працює з defaultType='future'
+        config["options"]["defaultType"] = "future"
+    
+    return ExClass(config)
+
 @st.cache_data(ttl=300, show_spinner=False)
-def get_top_usdt_perp_symbols(top_n: int):
-    ex = get_exchange()
-    # KuCoin використовує формат 'BTC-USDT' або 'XBTUSDTM' для ф'ючерсів
-    fallback = ["BTC/USDT", "ETH/USDT", "SOL/USDT"] 
+def get_top_usdt_perp_symbols(exchange_id: str, top_n: int):
+    ex = get_exchange(exchange_id)
+    fallback = ["BTC/USDT", "ETH/USDT"] # Спрощений fallback
     
     try:
         markets = ex.load_markets()
+        active_perps = []
         
-        # Фільтруємо для USDT Perpetual (Futures) на KuCoin
-        active_perps = [
-            s for s, m in markets.items() 
-            if m.get('type') == 'future' 
-            and m.get('quote') == 'USDT' 
-            and m.get('active')
-        ]
+        # УНІВЕРСАЛЬНА ЛОГІКА ФІЛЬТРУ (АДАПТОВАНО)
+        for s, m in markets.items():
+            if m.get('active') and m.get('quote') == 'USDT':
+                # Фільтруємо безстрокові контракти USDT
+                if exchange_id == 'binance' and m.get('swap') and m.get('linear'):
+                    active_perps.append(s)
+                elif exchange_id == 'bybit' and m.get('linear') is True and 'PERP' in s: # Bybit має linear=True
+                    active_perps.append(s)
+                elif exchange_id == 'kucoin' and m.get('type') == 'future': # KuCoin має type='future'
+                    active_perps.append(s)
         
         if not active_perps:
+            st.warning(f"No active perpetual USDT markets found on {exchange_id}. Using fallback.")
             return fallback, {}
 
         tickers = ex.fetch_tickers(active_perps)
         scored = []
         for s, t in tickers.items():
-            # KuCoin використовує 'baseVolume', 'quoteVolume' або 'volume'
-            vol = t.get('quoteVolume', 0) or t.get('volume', 0)
+            vol = t.get('quoteVolume', 0) or t.get('volume', 0) # ccxt уніфікація
             change_24h = t.get('percentage', 0) or 0
             scored.append((s, vol, change_24h))
         
@@ -87,19 +113,21 @@ def get_top_usdt_perp_symbols(top_n: int):
         changes_dict = {x[0]: x[2] for x in scored[:top_n]}
         return top_coins, changes_dict
     except Exception as e:
-        st.error(f"Error fetching symbols from KuCoin: {e}")
+        st.error(f"Error fetching symbols from {exchange_id}: {e}")
         return fallback, {}
 
 def fetch_single_coin(args):
     """Worker function for threading"""
-    symbol, tf, lim, ex_config = args
-    # Для ф'ючерсів KuCoin потрібен окремий синтаксис, ccxt це обробляє через defaultType: 'future'
-    ex = ccxt.kucoin(ex_config) 
+    symbol, tf, lim, exchange_id, ex_config = args
+    ExClass = EXCHANGE_CLASSES.get(exchange_id)
+    if not ExClass: return symbol, None, "Invalid exchange ID"
+    
+    # Створюємо інстанс біржі для потоку
+    ex = ExClass(ex_config)
     
     try:
         bars = ex.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
-        if not bars:
-            return symbol, None, "No data"
+        if not bars: return symbol, None, "No data"
             
         df = pd.DataFrame(bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
@@ -108,12 +136,12 @@ def fetch_single_coin(args):
         return symbol, None, str(e)
 
 # =========================
-# 4. LOGIC (БЕЗ ЗМІН)
+# 4. INDICATORS & LOGIC (БЕЗ ЗМІН)
 # =========================
 def calculate_indicators(df, rsi_per=14, atr_per=14, ema_per=200):
+    # ... (функція calculate_indicators без змін) ...
     if df is None or len(df) < ema_per: return df
     
-    # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
@@ -122,18 +150,17 @@ def calculate_indicators(df, rsi_per=14, atr_per=14, ema_per=200):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # ATR
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift(1)).abs()
     low_close = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1/atr_per, adjust=False).mean()
 
-    # EMA
     df["ema"] = df["close"].ewm(span=ema_per, adjust=False).mean()
     return df
 
 def get_signal(row, oversold, overbought):
+    # ... (функція get_signal без змін) ...
     rsi = row["rsi"]
     price = row["close"]
     ema = row["ema"]
@@ -152,7 +179,8 @@ def get_signal(row, oversold, overbought):
         
     return signal, trend, warning
 
-def generate_telegram_post(coin, price, atr, side, lev_range, offset_pct, sl_mult, tp_mults, tp_percents):
+def generate_telegram_post(coin, price, atr, side, lev_range, offset_pct, sl_mult, tp_mults, tp_percents, exchange_id):
+    # Додаємо біржу до посту
     base = coin.split("/")[0]
     
     if side == "SHORT":
@@ -171,7 +199,7 @@ def generate_telegram_post(coin, price, atr, side, lev_range, offset_pct, sl_mul
     reward_max = abs(entry_avg - tps[-1])
     rr = reward_max / risk if risk > 0 else 0
 
-    txt = f"#{base} {emoji} {side} (Lev: x{lev_range[0]}-{lev_range[1]})\n\n"
+    txt = f"#{base} {emoji} {side} ({exchange_id.upper()} | Lev: x{lev_range[0]}-{lev_range[1]})\n\n"
     txt += f"💰 Market: {fmt_price(price)}\n"
     txt += f"⏳ Limit: {fmt_price(limit_entry)}\n\n"
     
@@ -185,54 +213,72 @@ def generate_telegram_post(coin, price, atr, side, lev_range, offset_pct, sl_mul
     return txt
 
 # =========================
-# 5. SIDEBAR
+# 5. SIDEBAR UI (UNIVERSAL)
 # =========================
-st.sidebar.header("⚙️ KuCoin Scanner Config")
+st.sidebar.header("⚙️ Scanner Config")
 
-with st.sidebar.expander("🌍 Coins & Mode", expanded=False):
-    scan_mode = st.radio("Mode:", ["Auto Top-Volume", "Manual"], index=0)
-    n_coins = st.slider("Coins count", 10, 50, 20)
-    manual_coins = st.multiselect("Manual list", ["BTC/USDT", "ETH/USDT", "SOL/USDT"], default=["BTC/USDT"])
+# A. Exchange Selection (NEW!)
+with st.sidebar.expander("🌐 Вибір Біржі", expanded=True):
+    exchange_id = st.selectbox(
+        "Біржа:",
+        options=["kucoin", "bybit", "binance"],
+        index=0,
+        format_func=lambda x: x.upper()
+    )
+    st.markdown(f"> **KuCoin:** Рекомендовано для Streamlit Cloud (США) / **Binance, Bybit:** Краще з VPN/EU/UA IP.")
+    
+# B. Universe
+with st.sidebar.expander("🌍 Вибір монет", expanded=False):
+    scan_mode = st.radio("Режим:", ["Auto Top-Volume", "Ручний"], index=0)
+    n_coins = st.slider("К-сть монет (Top Volume)", 10, 50, 20)
+    # Ручний список має бути універсальним
+    manual_coins = st.multiselect("Монети", ["BTC/USDT", "ETH/USDT", "SOL/USDT"], default=["BTC/USDT"])
 
-with st.sidebar.expander("📊 Strategy", expanded=False):
-    tf = st.selectbox("Timeframe", ["5m", "15m", "1h", "4h"], index=1)
+# C. Strategy
+with st.sidebar.expander("📊 Стратегія (RSI & Trend)", expanded=False):
+    tf = st.selectbox("Таймфрейм", ["5m", "15m", "1h", "4h"], index=1)
     rsi_len = st.number_input("RSI Length", 7, 21, 14)
-    ob_level = st.slider("Short >", 60, 90, 70)
-    os_level = st.slider("Long <", 10, 40, 30)
-    ema_len = st.number_input("EMA Trend", 50, 200, 200)
+    ob_level = st.slider("Overbought (Short) >", 60, 90, 70)
+    os_level = st.slider("Oversold (Long) <", 10, 40, 30)
+    ema_len = st.number_input("EMA Trend Filter", 50, 200, 200)
 
-with st.sidebar.expander("💰 Risk Manager", expanded=False):
-    lev_range = (10, 20) 
-    limit_offset = st.slider("Limit Offset %", 0.0, 3.0, 1.0) / 100
-    sl_mult = st.slider("SL xATR", 1.0, 4.0, 2.0)
+# D. Risk Management
+with st.sidebar.expander("💰 Ризик Менеджмент", expanded=False):
+    lev_range = (10, 20)
+    limit_offset = st.slider("Відступ лімітки (%)", 0.0, 3.0, 1.0, step=0.1) / 100
+    sl_mult = st.slider("SL (x ATR)", 1.0, 4.0, 2.0, step=0.1)
     tp_setup = [1.0, 2.5, 4.0] 
     tp_pcts = [50, 30, 20]
 
 # =========================
-# 6. MAIN APP
+# 6. MAIN LOGIC
 # =========================
 col_act1, col_act2 = st.columns([3, 1])
 with col_act1:
-    st.info("💡 Використовуйте горизонтальну прокрутку для таблиць або вкладку 'Сигнали' для карток.")
+    st.info(f"💡 Сканування ринку: **{exchange_id.upper()}**")
 with col_act2:
-    start_btn = st.button("🚀 SCAN KUCOIN", type="primary")
+    start_btn = st.button(f"🚀 SCAN {exchange_id.upper()}", type="primary")
+
 
 if start_btn:
     coins = []
     changes = {}
     
-    with st.spinner("Fetching KuCoin markets..."):
+    with st.spinner(f"Завантаження списку монет з {exchange_id.upper()}..."):
         if scan_mode.startswith("Auto"):
-            coins, changes = get_top_usdt_perp_symbols(n_coins)
+            coins, changes = get_top_usdt_perp_symbols(exchange_id, n_coins)
         else:
             coins = manual_coins
 
     status_bar = st.progress(0)
     results = []
     
-    # Threading setup
-    ex_conf = {"enableRateLimit": True, "options": {"defaultType": "future"}}
-    tasks = [(c, tf, ema_len+50, ex_conf) for c in coins]
+    # Конфігурація біржі для потоків
+    base_ex_config = get_exchange(exchange_id).options
+    ex_conf = {"enableRateLimit": True, "options": base_ex_config}
+    
+    # Створюємо завдання для потоків: (символ, ТФ, ліміт, ID біржі, конфіг)
+    tasks = [(c, tf, ema_len+50, exchange_id, ex_conf) for c in coins]
     
     with ThreadPoolExecutor(max_workers=10) as executor:
         processed_count = 0
@@ -250,7 +296,7 @@ if start_btn:
                 if sig:
                     post_txt = generate_telegram_post(
                         symbol, last["close"], last["atr"], sig, 
-                        lev_range, limit_offset, sl_mult, tp_setup, tp_pcts
+                        lev_range, limit_offset, sl_mult, tp_setup, tp_pcts, exchange_id
                     )
 
                 results.append({
@@ -269,16 +315,18 @@ if start_btn:
     df_res = pd.DataFrame(results)
     
     if not df_res.empty:
+        # Сортування
         df_res["_sort"] = df_res["Signal"].apply(lambda x: 0 if x else 1)
         df_res = df_res.sort_values(["_sort", "RSI"], ascending=True)
 
         tab1, tab2 = st.tabs(["📱 Сигнали (Mobile)", "📊 Таблиця (Desktop)"])
         
+        # --- TAB 1: MOBILE CARDS ---
         with tab1:
             signals_only = df_res[df_res["Signal"].notna()]
             
             if signals_only.empty:
-                st.warning("No active signals found right now.")
+                st.warning(f"No active signals found on {exchange_id.upper()} right now.")
             else:
                 for _, row in signals_only.iterrows():
                     border_color = "#00ff00" if row["Signal"] == "LONG" else "#ff4b4b"
@@ -287,7 +335,7 @@ if start_btn:
                         st.markdown(f"""
                         <div class="mobile-card" style="border-left: 5px solid {border_color};">
                             <div class="card-header">
-                                <h3 style="margin:0">{row['Coin']}</h3>
+                                <h3 style="margin:0">{row['Coin']} ({exchange_id.upper()})</h3>
                                 <span class="{'signal-long' if row['Signal']=='LONG' else 'signal-short'}">{row['Signal']}</span>
                             </div>
                             <div style="display:flex; justify-content:space-between; margin-top:10px;">
@@ -302,6 +350,7 @@ if start_btn:
                         st.code(row["Post"], language="text")
                         st.divider()
 
+        # --- TAB 2: ADVANCED TABLE ---
         with tab2:
             st.dataframe(
                 df_res.style.apply(lambda x: ['background-color: #1e3a2f' if x.Signal == 'LONG' else ('background-color: #3a1e1e' if x.Signal == 'SHORT' else '') for i in x], axis=1),
@@ -316,4 +365,4 @@ if start_btn:
                 column_order=["Coin", "Price", "24h%", "RSI", "Signal", "Trend", "Warning"]
             )
     else:
-        st.error("Дані не отримані. Перевірте підключення до KuCoin API.")
+        st.error(f"Не вдалося отримати дані. Перевірте підключення до {exchange_id.upper()} та обмеження IP-адреси.")
