@@ -1,520 +1,1263 @@
-import streamlit as st
-import ccxt
-import pandas as pd
-import numpy as np
-from datetime import datetime
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+#!/usr/bin/env python3
+"""
+TG News Bot (Strict + Official-First + Better Dedup/Clustering) v3.5
+
+ENV (GitHub Environments / Secrets):
+- GOOGLE_API_KEY (secret)          required
+- TG_BOT_TOKEN (secret)            required
+- TG_CHAT_ID (var/secret)          required  e.g. -1001234567890
+- DIGEST_CHANNEL (var)             optional  e.g. @oximets_digest (default)
+
+Optional tuning:
+- REQUIRE_OFFICIAL_FOR_ATTACKS=1   (default 1)
+- CASUALTY_DIGEST_THRESHOLD=4      (default 4)
+- POST_WATCHLIST=1                 (default 1)
+- MAX_AGE_SECONDS=3800
+- NEWS_TO_PUBLISH=10
+- WATCH_TO_PUBLISH=5
+- AI_CONTEXT_LIMIT=200
+- DEEP_READ_LIMIT=25
+- STATE_DIR=.d7_state
+- SOURCES_FILE=./news_sources.json
+- SOURCES_JSON='{"rss_ua":[...], ...}'   (optional override)
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import json
 import time
-import textwrap  # <--- ВАЖЛИВО: Цей модуль виправляє відображення HTML
+import math
+import re
+import html
+import logging
+import hashlib
+import traceback
+from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from dateutil import parser as date_parser
+from urllib.parse import urlparse, urlunparse
+from zoneinfo import ZoneInfo
+
+import requests
+import numpy as np
+import feedparser
+import trafilatura
+import google.generativeai as genai
+from bs4 import BeautifulSoup
+from difflib import SequenceMatcher
+
+# --- ML (optional but recommended) ---
+try:
+    from sklearn.metrics.pairwise import cosine_distances  # noqa: F401
+    ML_AVAILABLE = True
+except Exception:
+    ML_AVAILABLE = False
 
 # =========================
-# 1. НАЛАШТУВАННЯ ТА ДИЗАЙН (TAILWIND + CSS)
+# ENV CONFIG
 # =========================
-st.set_page_config(
-    page_title="Crypto Sniper V6: UA Edition",
-    layout="wide",
-    page_icon="🦅",
-    initial_sidebar_state="expanded"
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
+DIGEST_CHANNEL = os.environ.get("DIGEST_CHANNEL", "@oximets_digest").strip()
+
+TARGET_CHATS: List[str] = []
+if TG_CHAT_ID:
+    TARGET_CHATS.append(TG_CHAT_ID)
+if DIGEST_CHANNEL and DIGEST_CHANNEL not in TARGET_CHATS:
+    TARGET_CHATS.append(DIGEST_CHANNEL)
+
+TG_ADMIN_ID = os.environ.get("TG_ADMIN_ID", "").strip()
+
+GEN_MODEL_NAME = os.environ.get("GEMINI_MODEL", "models/gemini-2.5-flash").strip()
+EMBED_MODEL_NAME = os.environ.get("EMBED_MODEL", "models/text-embedding-004").strip()
+
+REQUIRE_OFFICIAL_FOR_ATTACKS = os.environ.get("REQUIRE_OFFICIAL_FOR_ATTACKS", "1").strip() == "1"
+CASUALTY_DIGEST_THRESHOLD = int(os.environ.get("CASUALTY_DIGEST_THRESHOLD", "4").strip() or "4")
+POST_WATCHLIST = os.environ.get("POST_WATCHLIST", "1").strip() == "1"
+
+MAX_AGE_SECONDS = int(os.environ.get("MAX_AGE_SECONDS", "3800").strip() or "3800")
+AI_CONTEXT_LIMIT = int(os.environ.get("AI_CONTEXT_LIMIT", "200").strip() or "200")
+DEEP_READ_LIMIT = int(os.environ.get("DEEP_READ_LIMIT", "25").strip() or "25")
+
+NEWS_TO_PUBLISH = int(os.environ.get("NEWS_TO_PUBLISH", "10").strip() or "10")
+WATCH_TO_PUBLISH = int(os.environ.get("WATCH_TO_PUBLISH", "5").strip() or "5")
+
+CLUSTER_TIME_WINDOW_HOURS = float(os.environ.get("CLUSTER_TIME_WINDOW_HOURS", "8").strip() or "8")
+SEM_SIM_THRESHOLD = float(os.environ.get("SEM_SIM_THRESHOLD", "0.86").strip() or "0.86")
+SEM_SIM_SECONDARY = float(os.environ.get("SEM_SIM_SECONDARY", "0.80").strip() or "0.80")
+LEX_SIM_THRESHOLD = float(os.environ.get("LEX_SIM_THRESHOLD", "0.72").strip() or "0.72")
+LEX_SIM_OFFICIAL_THRESHOLD = float(os.environ.get("LEX_SIM_OFFICIAL_THRESHOLD", "0.68").strip() or "0.68")
+
+HISTORY_RETENTION_DAYS = int(os.environ.get("HISTORY_RETENTION_DAYS", "3").strip() or "3")
+HISTORY_TITLE_SIM_THRESHOLD = float(os.environ.get("HISTORY_TITLE_SIM_THRESHOLD", "0.80").strip() or "0.80")
+HISTORY_SIMHASH_STRICT = int(os.environ.get("HISTORY_SIMHASH_STRICT", "3").strip() or "3")
+HISTORY_SIMHASH_LOOSE = int(os.environ.get("HISTORY_SIMHASH_LOOSE", "6").strip() or "6")
+
+STATE_DIR = os.environ.get("STATE_DIR", ".d7_state").strip() or ".d7_state"
+os.makedirs(STATE_DIR, exist_ok=True)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SOURCES_FILE = os.environ.get("SOURCES_FILE", os.path.join(BASE_DIR, "news_sources.json")).strip()
+SOURCES_JSON = os.environ.get("SOURCES_JSON", "").strip()
+
+HISTORY_FILE = os.path.join(STATE_DIR, "published_news_history.json")
+CACHE_FILE = os.path.join(STATE_DIR, "cache_db.json")
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M"
 )
-
-# Інтеграція Tailwind CSS та кастомних стилів для Streamlit
-st.markdown("""
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        /* Глобальні налаштування */
-        @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;600&family=Inter:wght@400;700&display=swap');
-        
-        body {
-            background-color: #0f172a; /* slate-900 */
-            color: #e2e8f0;
-            font-family: 'Inter', sans-serif;
-        }
-        
-        /* Прибираємо стандартні відступи Streamlit */
-        .block-container {
-            padding-top: 2rem;
-            padding-bottom: 5rem;
-        }
-
-        /* Стилізація сайдбару */
-        section[data-testid="stSidebar"] {
-            background-color: #1e293b; /* slate-800 */
-            border-right: 1px solid #334155;
-        }
-        
-        /* Стилізація кнопок */
-        div.stButton > button {
-            background: linear-gradient(to right, #2563eb, #3b82f6);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 0.75rem 1.5rem;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            width: 100%;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
-        div.stButton > button:hover {
-            background: linear-gradient(to right, #1d4ed8, #2563eb);
-            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);
-            transform: translateY(-1px);
-        }
-
-        /* Стилізація метрик */
-        div[data-testid="stMetricValue"] {
-            color: #38bdf8; /* sky-400 */
-            font-family: 'Roboto Mono', monospace;
-        }
-        
-        /* Inputs */
-        .stTextInput > div > div > input, .stSelectbox > div > div > div {
-            background-color: #0f172a;
-            color: white;
-            border-radius: 6px;
-            border: 1px solid #334155;
-        }
-        
-        /* Scrollbar */
-        ::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
-        }
-        ::-webkit-scrollbar-track {
-            background: #0f172a; 
-        }
-        ::-webkit-scrollbar-thumb {
-            background: #334155; 
-            border-radius: 4px;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-            background: #475569; 
-        }
-    </style>
-""", unsafe_allow_html=True)
-
-# Ініціалізація стану (Session State)
-if "processed_signals" not in st.session_state:
-    st.session_state.processed_signals = {}
-if "scan_history" not in st.session_state:
-    st.session_state.scan_history = []
+log = logging.getLogger("tg_news_bot")
 
 # =========================
-# 2. МАТЕМАТИЧНЕ ЯДРО (UKRAINIAN LOGIC)
+# STOPWORDS
 # =========================
+STOPWORDS = {
+    "і","й","та","але","аби","щоб","який","яка","яке","які","це","ці","цей","ця","на","у","в","до","з","із","за","про",
+    "не","так","як","що","вже","ще","від","по","для","при","під","між","над","після","перед","зараз","сьогодні","вчора",
+    "the","a","an","and","or","to","of","in","on","for","with","from","by","as","at","is","are","was","were","be","been",
+    "но","и","а","что","это","этот","эта","эти","как","уже","еще","для","при","над","после","перед","сегодня","вчера",
+}
 
-def format_price(price):
-    """Розумне форматування ціни"""
-    if price < 0.01: return f"{price:.6f}"
-    if price < 1: return f"{price:.4f}"
-    if price < 100: return f"{price:.2f}"
-    return f"{price:.1f}"
+# =========================
+# AI PROMPT
+# =========================
+SYSTEM_PROMPT = """
+You are the Editorial AI of a Ukrainian Telegram news digest.
 
-def calculate_advanced_score(df):
-    """
-    Багатофакторний скоринг сигналу (0-100)
-    Враховує: RSI, Bollinger, Volume, Momentum
-    """
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    score = 0
-    side = None
-    
-    # 1. RSI Strength (0-40 points)
-    if last['rsi'] < 25:
-        score += 40
-        side = "LONG"
-    elif last['rsi'] > 75:
-        score += 40
-        side = "SHORT"
-    elif last['rsi'] < 35:
-        score += 25
-        side = "LONG"
-    elif last['rsi'] > 65:
-        score += 25
-        side = "SHORT"
-    
-    if side:
-        # 2. Bollinger Penetration (0-25 points)
-        if side == "LONG":
-            bb_penetration = (last['bb_low'] - last['close']) / last['atr']
-            if bb_penetration > 0.5: score += 25
-            elif bb_penetration > 0.2: score += 15
-        else:
-            bb_penetration = (last['close'] - last['bb_up']) / last['atr']
-            if bb_penetration > 0.5: score += 25
-            elif bb_penetration > 0.2: score += 15
-        
-        # 3. Volume Confirmation (0-20 points)
-        vol_ratio = last['vol'] / df['vol'].rolling(20).mean().iloc[-1]
-        if vol_ratio > 1.5: score += 20
-        elif vol_ratio > 1.2: score += 10
-        
-        # 4. Momentum Alignment (0-15 points)
-        if side == "LONG" and last['close'] > prev['close']:
-            score += 15
-        elif side == "SHORT" and last['close'] < prev['close']:
-            score += 15
-    
-    return side, min(score, 100)
+INPUT: ranked list of candidates with metadata (ID, time, source, category, cluster size, content).
+Return STRICT JSON.
 
-def calculate_setup(row, side, atr_multiplier=1.5, limit_offset_pct=0.015, lev_range="20-25"):
-    """Генерація сетапу з українським текстом"""
-    price = row['close']
-    atr = row['atr']
-    symbol = row['symbol'].replace("/USDT", "")
-    
-    if side == "SHORT":
-        emoji = "🟥"
-        limit_entry = price * (1 + limit_offset_pct)
-        avg_entry = (price + limit_entry) / 2
-        sl_price = avg_entry + (atr * atr_multiplier)
-        tp1 = avg_entry - (atr * 1.0)
-        tp2 = avg_entry - (atr * 2.0)
-        tp3 = avg_entry - (atr * 4.0)
-    else:
-        emoji = "🟩"
-        limit_entry = price * (1 - limit_offset_pct)
-        avg_entry = (price + limit_entry) / 2
-        sl_price = avg_entry - (atr * atr_multiplier)
-        tp1 = avg_entry + (atr * 1.0)
-        tp2 = avg_entry + (atr * 2.0)
-        tp3 = avg_entry + (atr * 4.0)
+CRITICAL FILTERS:
+1) WAR COVERAGE — NO ROUTINE REPORTS:
+   - REJECT: daily General Staff summaries, village captures, routine shelling statistics, tactical movements
+   - REJECT: vague "explosions heard" without confirmed damage/casualties
+   - ACCEPT: significant attacks with confirmed damage/casualties, major infrastructure strikes, new weapon deployments,
+             high-casualty events, command decisions, major breakthroughs
 
-    # Форматування повідомлення для Telegram (в стилі Sniper)
-    text_msg = f"""
-🎯 <b>СИГНАЛ: {symbol}</b>
-{emoji} Напрям: <b>{side}</b>
-⚡ Плече: x{lev_range}
+2) POLITICS — NO EMPTY STATEMENTS:
+   - REJECT: "held meeting", "expressed concern", "discussed plans", "urged", "called for", "expert says" without new facts
+   - ACCEPT: laws signed, budgets approved, weapons delivered, sanctions imposed, arrests, concrete actions with numbers/dates
 
-📊 <b>ВХІД У ПОЗИЦІЮ:</b>
-• По ринку: {format_price(price)}
-• Лімітний ордер: {format_price(limit_entry)}
-<i>(Середня точка входу: {format_price(avg_entry)})</i>
+3) FUNDRAISING / CHARITY / GIVEAWAYS — HARD REJECT:
+   - REJECT: any "збір", "донат", "банка", "розіграш", "подарунки", "підтримайте", "fundraising", "donate", "charity"
 
-💰 <b>ФІКСАЦІЯ (Take-Profit):</b>
-1️⃣ {format_price(tp1)}
-2️⃣ {format_price(tp2)}
-3️⃣ 🚀 {format_price(tp3)}
+4) INTERNATIONAL — IMPACT FOCUS:
+   - REJECT: generic statements of support
+   - ACCEPT: military aid packages (amounts), policy changes, sanctions details, deployments, confirmed incidents
 
-🛡️ <b>СТОП-ЛОС:</b> {format_price(sl_price)}
-    """
-    
-    return {
-        "symbol": symbol,
-        "side": side,
-        "msg": text_msg.strip(),
-        "price": price,
-        "score": row['score'],
-        "avg_entry": avg_entry,
-        "sl": sl_price,
-        "tp1": tp1,
-        "atr": atr
-    }
+5) DEDUPLICATION:
+   - If multiple candidates cover the same event, select ONLY the most detailed/official one
+   - Discard duplicates
 
-def analyze_single_symbol(exchange, symbol, tf, min_score):
-    """Аналіз одного символу"""
+WRITING RULES (Output in Ukrainian):
+Headline:
+- factual, specific, informative; no clickbait, no questions, no vague phrases
+Body:
+- 1–3 concise sentences with essential facts (what/where/when/who/numbers)
+- no speculation
+
+TONE REQUIREMENTS:
+War/attacks/casualties — strictly neutral/serious:
+- use precise terms: "обстріл", "удар", "атака", "жертви", "поранені", "пошкоджено"
+- forbidden: slang/euphemisms/irony about attacks on Ukraine
+
+CATEGORY ASSIGNMENT:
+- war, intl, ua, society, meme
+
+VERIFICATION NOTES:
+- official (government/OVA/DSNS/forces), major_media, unverified
+
+SELECTION TARGETS:
+- Select up to {NEWS_TARGET} items for NEWS
+- Select up to {WATCH_TARGET} items for WATCH (international)
+
+OUTPUT FORMAT (JSON only):
+{{
+  "editorial_chat": "short explanation",
+  "publish": [
+    {{
+      "id": <int>,
+      "headline": "...",
+      "body": "...",
+      "category": "war|intl|ua|society|meme",
+      "verification_note": "official|major_media|unverified"
+    }}
+  ]
+}}
+"""
+
+# =========================
+# HTTP SESSION
+# =========================
+def get_session() -> requests.Session:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    s = requests.Session()
+    retries = Retry(
+        total=2,
+        backoff_factor=0.35,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"])
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=50, pool_maxsize=50)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update({"User-Agent": "Mozilla/5.0 (compatible; TGNewsBot/3.5)"})
+    return s
+
+SESSION = get_session()
+
+# =========================
+# JSON IO
+# =========================
+def load_json(path: str, default=None):
+    if default is None:
+        default = {}
     try:
-        bars = exchange.fetch_ohlcv(symbol, tf, limit=100)
-        if not bars or len(bars) < 50: return None
-        
-        df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
-        if df['close'].isna().any() or len(df) < 50: return None
-        
-        # RSI
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
-        loss = -delta.where(delta < 0, 0).ewm(alpha=1/14, adjust=False).mean()
-        rs = gain / loss.replace(0, np.nan)
-        df['rsi'] = 100 - (100 / (1 + rs))
-        
-        # Bollinger
-        df['sma'] = df['close'].rolling(20).mean()
-        df['std'] = df['close'].rolling(20).std()
-        df['bb_up'] = df['sma'] + (df['std'] * 2.0)
-        df['bb_low'] = df['sma'] - (df['std'] * 2.0)
-        
-        # ATR
-        high_low = df['high'] - df['low']
-        high_close = np.abs(df['high'] - df['close'].shift())
-        low_close = np.abs(df['low'] - df['close'].shift())
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        df['tr'] = ranges.max(axis=1)
-        df['atr'] = df['tr'].rolling(14).mean()
-        
-        last = df.iloc[-1]
-        if pd.isna(last['rsi']) or pd.isna(last['atr']) or last['atr'] == 0: return None
-        
-        side, score = calculate_advanced_score(df)
-        
-        if side and score >= min_score:
-            last = df.iloc[-1].copy()
-            last['symbol'] = symbol
-            last['score'] = score
-            return (last, side, score)
-        return None
-    except:
-        return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-def normalize_exchange_name(exchange_name):
-    mapping = {
-        "HTX (Huobi)": "htx", "Gate.io": "gateio", "Binance": "binance",
-        "Bybit": "bybit", "OKX": "okx", "Bitget": "bitget",
-        "MEXC": "mexc", "Kraken": "kraken", "KuCoin": "kucoinfutures"
-    }
-    return mapping.get(exchange_name, exchange_name.lower())
-
-def analyze_market_parallel(exchange_name, symbols, tf, min_score=60, max_workers=10):
-    ex_name = normalize_exchange_name(exchange_name)
-    exchange = getattr(ccxt, ex_name)({
-        'enableRateLimit': True, 'timeout': 30000, 'options': {'defaultType': 'swap'}
-    })
-    signals = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_symbol = {
-            executor.submit(analyze_single_symbol, exchange, sym, tf, min_score): sym 
-            for sym in symbols
-        }
-        for future in as_completed(future_to_symbol):
-            result = future.result()
-            if result: signals.append(result)
-    signals.sort(key=lambda x: x[2], reverse=True)
-    return signals
-
-def get_top_symbols(exchange_name, limit=100):
-    """Отримання списку монет"""
+def save_json(path: str, data):
     try:
-        ex_name = normalize_exchange_name(exchange_name)
-        if not hasattr(ccxt, ex_name): return []
-        exchange = getattr(ccxt, ex_name)({
-            'enableRateLimit': True, 'timeout': 30000, 'options': {'defaultType': 'swap'}
-        })
-        
-        markets = exchange.load_markets()
-        valid_symbols = []
-        
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"Failed to save {path}: {e}")
+
+def load_sources_cfg() -> dict:
+    if SOURCES_JSON:
         try:
-            tickers = exchange.fetch_tickers()
-            for symbol in markets:
-                if ("/USDT" in symbol or ":USDT" in symbol):
-                    market = markets[symbol]
-                    if market.get('swap') or market.get('future') or market.get('type') in ['swap', 'future']:
-                        ticker = tickers.get(symbol, {})
-                        volume = ticker.get('quoteVolume') or ticker.get('volume') or 0
-                        if volume > 0: valid_symbols.append((symbol, volume))
-            
-            if valid_symbols:
-                valid_symbols.sort(key=lambda x: x[1], reverse=True)
-                return [s[0] for s in valid_symbols[:limit]]
-        except:
-            # Fallback
-            for symbol in markets:
-                if ("/USDT" in symbol or ":USDT" in symbol):
-                    valid_symbols.append(symbol)
-            return valid_symbols[:limit]
-            
-        return []
-    except:
-        return []
+            return json.loads(SOURCES_JSON)
+        except Exception as e:
+            log.warning(f"SOURCES_JSON invalid, fallback to file: {e}")
+    return load_json(SOURCES_FILE, {}) or {}
 
-def send_to_tg(token, chat_id, text):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+# =========================
+# TEXT UTILS
+# =========================
+def normalize_url(url: str) -> str:
+    if not url:
+        return ""
     try:
-        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=5)
-        return True
-    except:
+        p = urlparse(url)
+        q = p.query or ""
+        drop_prefixes = ("utm_",)
+        drop_exact = {
+            "fbclid", "gclid", "yclid", "mc_cid", "mc_eid", "cmpid",
+            "mkt_tok", "sr_share", "ref", "referrer", "rss", "rssfeed"
+        }
+        if q:
+            kept = []
+            for part in q.split("&"):
+                if not part:
+                    continue
+                k = part.split("=", 1)[0].strip().lower()
+                if any(k.startswith(px) for px in drop_prefixes):
+                    continue
+                if k in drop_exact:
+                    continue
+                kept.append(part)
+            q = "&".join(kept)
+        return urlunparse((p.scheme, p.netloc, p.path, "", q, ""))
+    except Exception:
+        return url
+
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    soup = BeautifulSoup(text, "html.parser")
+    t = soup.get_text(separator=" ")
+    t = re.sub(r"http\S+", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    junk_phrases = [
+        "читайте також", "підписуйтесь", "всі права захищені", "копіювання заборонено",
+        "долучайтесь", "новини партнерів", "більше новин", "наш телеграм",
+        "джерело:", "photo by", "getty images"
+    ]
+    low = t.lower()
+    for junk in junk_phrases:
+        if junk in low:
+            idx = low.find(junk)
+            if idx > 150:
+                t = t[:idx].strip()
+                break
+    return t
+
+def normalize_title(title: str) -> str:
+    return re.sub(r"[^\w\s'’іїєґІЇЄҐ-]", "", (title or "").lower()).strip()
+
+def tokenize(text: str) -> List[str]:
+    t = re.sub(r"[^\w\s'’іїєґІЇЄҐ-]", " ", (text or "").lower())
+    parts = [x.strip("-'’") for x in t.split() if x]
+    parts = [x for x in parts if len(x) > 2 and x not in STOPWORDS]
+    return parts[:160]
+
+def jaccard(a: List[str], b: List[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / max(1, len(sa | sb))
+
+def sim_title(a: str, b: str) -> float:
+    an = normalize_title(a)
+    bn = normalize_title(b)
+    if not an or not bn:
+        return 0.0
+    ratio = SequenceMatcher(None, an, bn).ratio()
+    jac = jaccard(tokenize(an), tokenize(bn))
+    return max(ratio, jac)
+
+def simhash64(text: str) -> int:
+    toks = tokenize(text)
+    if not toks:
+        return 0
+    v = [0] * 64
+    for tok in toks:
+        h = hashlib.md5(tok.encode("utf-8")).digest()
+        x = int.from_bytes(h[:8], "big", signed=False)
+        for i in range(64):
+            v[i] += 1 if (x >> i) & 1 else -1
+    out = 0
+    for i in range(64):
+        if v[i] > 0:
+            out |= (1 << i)
+    return out
+
+def hamming64(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+# =========================
+# HARD FILTERS
+# =========================
+FUNDRAISING_WORDS = [
+    "збір", "збори", "донат", "донати", "задонать", "підтримайте", "підтримати",
+    "банка", "монобанк", "mono", "розіграш", "подарунки", "лотерея", "raffle", "giveaway",
+    "fundraising", "donate", "charity"
+]
+JUNK_TOPICS = [
+    "гороскоп", "астролог", "сонник", "курс валют", "погода", "зодіак",
+    "скандал", "п'яний", "сварка"
+]
+
+def has_any(text: str, words: List[str]) -> bool:
+    low = (text or "").lower()
+    return any(w in low for w in words)
+
+ATTACK_KEYWORDS = [
+    "обстріл", "атака", "удар", "вибух", "ракета", "ракет", "дрон", "дрони", "shahed",
+    "пошкоджено", "зруйновано", "влучання", "загинул", "загиблих", "поранен", "жертв"
+]
+
+def is_attack_like(title: str, body: str) -> bool:
+    blob = f"{title} {body}".lower()
+    return any(k in blob for k in ATTACK_KEYWORDS)
+
+# =========================
+# HISTORY
+# =========================
+def load_history() -> dict:
+    data = load_json(HISTORY_FILE, {"items": []})
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=HISTORY_RETENTION_DAYS)
+
+    fresh = []
+    for it in data.get("items", []):
+        try:
+            ts = date_parser.parse(it.get("ts", ""))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts > cutoff:
+                fresh.append(it)
+        except Exception:
+            pass
+
+    data["items"] = fresh
+    return data
+
+def add_to_history(items: list, history: dict):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for it in items:
+        title = it.get("title", "")
+        body = clean_text(it.get("full_text", ""))[:800]
+        fp = simhash64(f"{title} {body}")
+
+        history["items"].append({
+            "ts": now_iso,
+            "link": it.get("link", ""),
+            "url_norm": normalize_url(it.get("link", "")),
+            "title": title,
+            "title_norm": normalize_title(title),
+            "source": it.get("source", ""),
+            "simhash": str(fp),
+            "bucket": it.get("bucket", ""),
+            "is_official": bool(it.get("is_official", False)),
+        })
+    save_json(HISTORY_FILE, history)
+
+def is_duplicate(item: dict, history: dict) -> bool:
+    new_url_norm = normalize_url(item.get("link", ""))
+
+    if new_url_norm:
+        for old in history.get("items", []):
+            if normalize_url(old.get("link", "")) == new_url_norm:
+                return True
+            if old.get("url_norm") == new_url_norm:
+                return True
+
+    new_title = item.get("title", "")
+    new_title_norm = normalize_title(new_title)
+    if len(new_title_norm) < 10:
         return False
 
-# =========================
-# 3. ІНТЕРФЕЙС (TAILWIND COMPONENTS)
-# =========================
+    new_body = clean_text(item.get("full_text", ""))[:800]
+    new_fp = simhash64(f"{new_title} {new_body}")
 
-# Header with custom styling
-st.markdown("""
-    <div class="flex flex-col items-center justify-center mb-8">
-        <h1 class="text-4xl md:text-6xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-600 tracking-tighter">
-            EAGLE EYE <span class="text-white">V6</span>
-        </h1>
-        <p class="text-slate-400 mt-2 font-mono text-sm tracking-widest uppercase">Система автоматичного сканування ринку</p>
-    </div>
-""", unsafe_allow_html=True)
+    new_dt = item.get("dt")
+    if new_dt and new_dt.tzinfo is None:
+        new_dt = new_dt.replace(tzinfo=timezone.utc)
 
-# Sidebar
-with st.sidebar:
-    st.markdown('<div class="text-xl font-bold text-white mb-4 px-2 border-l-4 border-blue-500">⚙️ Конфігурація</div>', unsafe_allow_html=True)
-    
-    ex_sel = st.selectbox("Оберіть Біржу", [
-        "Binance", "Bybit", "OKX", "Gate.io", "Bitget", "MEXC", "Kraken", "KuCoin"
-    ], index=1)
-    
-    tf = st.selectbox("Таймфрейм", ["5m", "15m", "1h", "4h"], index=1)
-    
-    st.markdown('<div class="h-px bg-slate-700 my-4"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="text-sm font-bold text-slate-300 mb-2 uppercase tracking-wide">Налаштування сканера</div>', unsafe_allow_html=True)
-    
-    num_symbols = st.slider("Кількість монет", 20, 300, 100, step=10)
-    min_score = st.slider("Мін. точність входу (%)", 50, 95, 65, step=5)
-    max_workers = st.slider("Потоки (Швидкість)", 5, 30, 15, step=1)
-    
-    st.markdown('<div class="h-px bg-slate-700 my-4"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="text-sm font-bold text-slate-300 mb-2 uppercase tracking-wide">Параметри угоди</div>', unsafe_allow_html=True)
-    
-    lev_range = st.text_input("Кредитне плече", "20-50")
-    limit_pct = st.slider("Відступ лімітки (%)", 0.1, 4.0, 1.2, step=0.1) / 100
-    atr_mult = st.slider("Множник стоп-лосу (ATR)", 1.0, 4.0, 1.5, step=0.1)
-    
-    st.markdown('<div class="bg-slate-900 p-4 rounded-lg border border-slate-700 mt-4"><div class="text-xs text-slate-400">🤖 <b>Telegram Бот</b></div>', unsafe_allow_html=True)
-    auto_send = st.checkbox("Авто-відправка", value=False)
-    tg_token = st.text_input("Token бота", type="password", placeholder="123:ABC...")
-    tg_chat = st.text_input("Chat ID", placeholder="-100...")
-    st.markdown('</div>', unsafe_allow_html=True)
+    for old in history.get("items", []):
+        old_title_norm = old.get("title_norm") or normalize_title(old.get("title", ""))
 
-# Metrics Dashboard
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.markdown(f"""
-        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-lg">
-            <div class="text-slate-400 text-xs uppercase font-bold tracking-wider mb-1">Історія сканувань</div>
-            <div class="text-2xl font-mono text-white">{len(st.session_state.scan_history)}</div>
-        </div>
-    """, unsafe_allow_html=True)
-with col2:
-    st.markdown(f"""
-        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-lg">
-            <div class="text-slate-400 text-xs uppercase font-bold tracking-wider mb-1">Знайдено сигналів</div>
-            <div class="text-2xl font-mono text-green-400">{len(st.session_state.processed_signals)}</div>
-        </div>
-    """, unsafe_allow_html=True)
-with col3:
-    last_scan = st.session_state.scan_history[-1].strftime("%H:%M:%S") if st.session_state.scan_history else "--:--"
-    st.markdown(f"""
-        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-lg">
-            <div class="text-slate-400 text-xs uppercase font-bold tracking-wider mb-1">Останній запуск</div>
-            <div class="text-2xl font-mono text-blue-400">{last_scan}</div>
-        </div>
-    """, unsafe_allow_html=True)
+        if len(new_title_norm) > 14 and new_title_norm == old_title_norm:
+            return True
 
-st.write("") # Spacer
+        try:
+            old_fp = int(old.get("simhash", "0"))
+        except Exception:
+            old_fp = 0
+
+        if old_fp and new_fp:
+            dist = hamming64(new_fp, old_fp)
+            if dist <= HISTORY_SIMHASH_STRICT:
+                return True
+            if dist <= HISTORY_SIMHASH_LOOSE:
+                try:
+                    old_ts = date_parser.parse(old.get("ts", ""))
+                    if old_ts.tzinfo is None:
+                        old_ts = old_ts.replace(tzinfo=timezone.utc)
+                    if new_dt and abs((new_dt - old_ts).total_seconds()) < 10 * 3600:
+                        return True
+                except Exception:
+                    pass
+
+        if abs(len(new_title_norm) - len(old_title_norm)) < 30:
+            if SequenceMatcher(None, new_title_norm, old_title_norm).ratio() > HISTORY_TITLE_SIM_THRESHOLD:
+                return True
+
+    return False
 
 # =========================
-# 4. ГОЛОВНА ЛОГІКА
+# COLLECTION
 # =========================
-
-if st.button("🚀 ЗАПУСТИТИ СКАНЕР РИНКУ", type="primary"):
-    
-    start_time = time.time()
-    
-    # Progress UI
-    progress_text = st.markdown('<p class="text-blue-400 animate-pulse text-center">⏳ Підключення до біржі...</p>', unsafe_allow_html=True)
-    progress_bar = st.progress(0)
-    
+def fetch_telegram(username: str, cache: dict) -> list:
+    url = f"https://t.me/s/{username}"
+    if url in cache and (time.time() - cache[url].get("ts", 0) < 180):
+        return []
     try:
-        # 1. Fetch
-        symbols = get_top_symbols(ex_sel, num_symbols)
-        if not symbols:
-            st.error("❌ Не вдалося отримати дані. Перевірте з'єднання або змініть біржу.")
-            st.stop()
-            
-        progress_text.markdown(f'<p class="text-blue-400 text-center">🔭 Аналіз {len(symbols)} активів...</p>', unsafe_allow_html=True)
-        progress_bar.progress(25)
-        
-        # 2. Analyze
-        raw_signals = analyze_market_parallel(ex_sel, symbols, tf, min_score, max_workers)
-        progress_bar.progress(100)
-        elapsed = time.time() - start_time
-        
-        # 3. Results
-        progress_text.empty()
-        st.session_state.scan_history.append(datetime.now())
-        
-        if raw_signals:
-            st.markdown(f"""
-                <div class="flex items-center justify-between bg-green-900/30 border border-green-500/50 p-4 rounded-lg mb-6">
-                    <div class="flex items-center gap-3">
-                        <span class="text-2xl">✅</span>
-                        <div>
-                            <div class="font-bold text-green-400">Сканування завершено!</div>
-                            <div class="text-sm text-green-200/70">Знайдено {len(raw_signals)} потенційних угод за {elapsed:.1f} сек.</div>
-                        </div>
-                    </div>
-                </div>
-            """, unsafe_allow_html=True)
-            
-            # ВІДОБРАЖЕННЯ КАРТОК СИГНАЛІВ
-            for i, (row_data, side, score) in enumerate(raw_signals):
-                setup = calculate_setup(row_data, side, atr_mult, limit_pct, lev_range)
-                
-                # Кольори та стилі для картки
-                border_color = "border-green-500" if side == "LONG" else "border-red-500"
-                bg_gradient = "from-green-900/20 to-slate-800" if side == "LONG" else "from-red-900/20 to-slate-800"
-                text_color = "text-green-400" if side == "LONG" else "text-red-400"
-                badge_bg = "bg-green-600" if side == "LONG" else "bg-red-600"
-                
-                # HTML структура картки (Tailwind)
-                # ВИПРАВЛЕНО: textwrap.dedent для коректного рендеру HTML
-                card_html = textwrap.dedent(f"""
-                    <div class="mb-6 p-1 rounded-2xl bg-gradient-to-r {bg_gradient} p-[1px]">
-                        <div class="bg-slate-900 rounded-2xl p-6 border border-slate-700 relative overflow-hidden">
-                            <div class="flex justify-between items-start mb-4">
-                                <div>
-                                    <div class="flex items-center gap-2">
-                                        <h2 class="text-2xl font-bold text-white">{setup['symbol']}</h2>
-                                        <span class="{badge_bg} text-white text-xs font-bold px-2 py-1 rounded-md uppercase">{side}</span>
-                                    </div>
-                                    <div class="text-slate-400 text-sm font-mono mt-1">Ціна: ${format_price(setup['price'])}</div>
-                                </div>
-                                <div class="text-right">
-                                    <div class="text-3xl font-black {text_color}">{score}</div>
-                                    <div class="text-xs text-slate-500 uppercase font-bold tracking-wider">Рейтинг</div>
-                                </div>
-                            </div>
-                            
-                            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4 bg-slate-800/50 p-4 rounded-xl border border-slate-700/50">
-                                <div>
-                                    <div class="text-slate-500 text-xs">Вхід (Ліміт)</div>
-                                    <div class="text-white font-mono font-bold">${format_price(setup['avg_entry'])}</div>
-                                </div>
-                                 <div>
-                                    <div class="text-slate-500 text-xs">Стоп-лос</div>
-                                    <div class="text-red-400 font-mono font-bold">${format_price(setup['sl'])}</div>
-                                </div>
-                                 <div>
-                                    <div class="text-slate-500 text-xs">Тейк-профіт 1</div>
-                                    <div class="text-green-400 font-mono font-bold">${format_price(setup['tp1'])}</div>
-                                </div>
-                                 <div>
-                                    <div class="text-slate-500 text-xs">Ризик/Прибуток</div>
-                                    <div class="text-blue-300 font-mono font-bold">1:{((setup["tp1"] - setup["avg_entry"]) / (setup["avg_entry"] - setup["sl"])):.1f}</div>
-                                </div>
-                            </div>
-                            
-                            <div class="bg-slate-950 p-4 rounded-lg font-mono text-xs text-slate-300 whitespace-pre-wrap border-l-4 {border_color}">
-{setup['msg']}
-                            </div>
-                        </div>
-                    </div>
-                """)
-                
-                st.markdown(card_html, unsafe_allow_html=True)
-                
-                # Send Logic
-                if auto_send and tg_token and tg_chat:
-                    sig_id = f"{setup['symbol']}_{side}_{datetime.now().strftime('%Y%m%d_%H')}"
-                    if sig_id not in st.session_state.processed_signals:
-                        success = send_to_tg(tg_token, tg_chat, setup['msg']) 
-                        if success:
-                            st.session_state.processed_signals[sig_id] = True
-                            st.toast(f"📨 Відправлено в Telegram: {setup['symbol']}")
+        r = SESSION.get(url, timeout=8)
+        cache[url] = {"ts": time.time()}
+        if r.status_code != 200:
+            return []
 
+        soup = BeautifulSoup(r.text, "html.parser")
+        posts = []
+
+        for wrap in soup.select(".tgme_widget_message_wrap"):
+            if wrap.select_one(".tgme_widget_message_service"):
+                continue
+            msg = wrap.select_one(".tgme_widget_message_text")
+            if not msg:
+                continue
+
+            meta = wrap.select_one(".tgme_widget_message_date")
+            link = meta.get("href", "") if meta else ""
+
+            dt = None
+            if meta and meta.select_one("time"):
+                raw_dt = meta.select_one("time").get("datetime")
+                try:
+                    dt = date_parser.parse(raw_dt).astimezone(timezone.utc)
+                except Exception:
+                    dt = None
+
+            if not dt:
+                continue
+
+            text_content = msg.get_text(separator="\n")
+            title = (text_content.split("\n")[0] if text_content else "").strip()
+            if not title:
+                title = "Telegram пост"
+
+            posts.append({
+                "title": title[:110],
+                "full_text": text_content,
+                "link": link,
+                "dt": dt,
+                "type": "tg",
+            })
+
+        return posts
+    except Exception:
+        return []
+
+def fetch_rss(url: str, cache: dict) -> list:
+    if url in cache and (time.time() - cache[url].get("ts", 0) < 300):
+        return []
+    try:
+        r = SESSION.get(url, timeout=10)
+        cache[url] = {"ts": time.time()}
+        if r.status_code != 200:
+            return []
+
+        d = feedparser.parse(r.content)
+        posts = []
+
+        for e in d.entries:
+            dt = None
+            if getattr(e, "published_parsed", None):
+                try:
+                    dt = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
+                except Exception:
+                    dt = None
+            if not dt and getattr(e, "published", None):
+                try:
+                    dt = date_parser.parse(e.published)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    else:
+                        dt = dt.astimezone(timezone.utc)
+                except Exception:
+                    dt = None
+            if not dt:
+                continue
+
+            full_text = e.get("summary", "") or e.get("description", "") or ""
+            link = e.get("link", "") or ""
+            posts.append({
+                "title": e.get("title", "") or "Новина",
+                "full_text": full_text,
+                "link": link,
+                "dt": dt,
+                "type": "rss",
+            })
+        return posts
+    except Exception:
+        return []
+
+def classify_source_bucket(key: str) -> Tuple[str, bool]:
+    key = key.lower()
+    if "intl" in key or "geo" in key or "factcheck" in key or "watch" in key:
+        return "watch", True
+    return "news", False
+
+def is_official_group(group_name: str) -> bool:
+    return group_name in {"top_state", "defense_security", "law_justice", "energy", "ova_heads", "mayors"}
+
+def collect_all(cfg: dict, history: dict) -> list:
+    cache = load_json(CACHE_FILE, {})
+    now = datetime.now(timezone.utc)
+    data = []
+
+    source_names = cfg.get("source_names", {}) or {}
+    source_weights = cfg.get("source_weights", {}) or {}
+
+    def get_weight_for_host(host: str, default_w: int) -> int:
+        host = host.replace("www.", "")
+        w = default_w
+        for k, v in source_weights.items():
+            if k and k in host:
+                w = int(v)
+        return w
+
+    def process_item(it: dict, bucket: str, src: str, is_intl: bool, w: int, is_official: bool):
+        age = (now - it["dt"]).total_seconds()
+        if age > MAX_AGE_SECONDS or age < -300:
+            return
+
+        it["bucket"] = bucket
+        it["source"] = src
+        it["is_intl"] = bool(is_intl)
+        it["weight"] = float(w)
+        it["is_official"] = bool(is_official)
+
+        blob = f"{it.get('title','')} {it.get('full_text','')}"
+        if has_any(blob, FUNDRAISING_WORDS):
+            return
+        if has_any(blob, JUNK_TOPICS):
+            return
+
+        if is_duplicate(it, history):
+            return
+
+        data.append(it)
+
+    # RSS groups
+    for k, urls in cfg.items():
+        if not k.startswith("rss_"):
+            continue
+
+        bucket, is_intl = classify_source_bucket(k)
+        rss_is_official = k in {"rss_gov", "rss_defense", "rss_regional"}
+
+        for url in (urls or []):
+            items = fetch_rss(url, cache)
+            host = urlparse(url).netloc.replace("www.", "")
+            src = source_names.get(host, host.capitalize() if host else "RSS")
+
+            base = 9 if rss_is_official else (6 if k in {"rss_ua", "rss_intl", "rss_geo", "rss_factcheck"} else 5)
+            w = get_weight_for_host(host, base)
+
+            for it in items:
+                process_item(it, bucket, src, is_intl, w, rss_is_official)
+
+    # Telegram groups
+    tg = cfg.get("telegram_official", {}) or {}
+    for group_name, chans in tg.items():
+        group_official = is_official_group(group_name)
+        for ch in (chans or []):
+            is_off = group_official and group_name != "intl_watch"
+            bucket = "watch" if group_name == "intl_watch" else "news"
+            is_intl = group_name == "intl_watch"
+
+            src = cfg.get("source_names", {}).get(ch, ch)
+            w = 14 if is_off else (6 if is_intl else 5)
+            w = int(cfg.get("source_weights", {}).get(ch, w))
+
+            items = fetch_telegram(ch, cache)
+            for it in items:
+                process_item(it, bucket, src, is_intl, w, is_off)
+
+    save_json(CACHE_FILE, cache)
+    return data
+
+# =========================
+# OFFICIAL-FIRST FOR ATTACKS
+# =========================
+def prefer_official_for_attacks(items: list) -> list:
+    if not items:
+        return items
+
+    officials = [x for x in items if x.get("is_official")]
+    if not officials:
+        return items
+
+    for it in officials:
+        if "fp" not in it:
+            body = clean_text(it.get("full_text", ""))[:1200]
+            it["fp"] = simhash64(f"{it.get('title','')} {body}")
+
+    out = []
+    for it in items:
+        title = it.get("title", "")
+        body = clean_text(it.get("full_text", ""))[:1200]
+
+        if not is_attack_like(title, body):
+            out.append(it)
+            continue
+
+        if it.get("is_official"):
+            out.append(it)
+            continue
+
+        dt = it.get("dt")
+        if dt and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        it_fp = simhash64(f"{title} {body}")
+
+        best = None
+        best_score = -1.0
+
+        for off in officials:
+            odt = off.get("dt")
+            if odt and odt.tzinfo is None:
+                odt = odt.replace(tzinfo=timezone.utc)
+
+            if dt and odt and abs((dt - odt).total_seconds()) > CLUSTER_TIME_WINDOW_HOURS * 3600:
+                continue
+
+            off_fp = off.get("fp", 0)
+            dist = hamming64(it_fp, off_fp) if (it_fp and off_fp) else 64
+            s1 = max(0.0, 1.0 - dist / 24.0)
+            s2 = sim_title(title, off.get("title", ""))
+            score = 0.65 * s1 + 0.35 * s2
+
+            if score > best_score:
+                best_score = score
+                best = off
+
+        if best and best_score >= 0.62:
+            out.append(best)
         else:
-            st.markdown("""
-                <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 text-center">
-                    <div class="text-4xl mb-2">😴</div>
-                    <h3 class="text-xl font-bold text-white mb-2">Ринок спить</h3>
-                    <p class="text-slate-400">Сильні сигнали відсутні. Спробуйте змінити таймфрейм або знизити поріг рейтингу.</p>
-                </div>
-            """, unsafe_allow_html=True)
-            
+            if REQUIRE_OFFICIAL_FOR_ATTACKS:
+                continue
+            it["ai_verification"] = "unverified"
+            out.append(it)
+
+    return out
+
+# =========================
+# EMBEDDINGS
+# =========================
+def get_embeddings(texts: List[str]) -> Optional[np.ndarray]:
+    if not texts:
+        return None
+    try:
+        res = genai.embed_content(model=EMBED_MODEL_NAME, content=texts, task_type="clustering")
+        emb = res.get("embedding")
+        if not emb or len(emb) != len(texts):
+            return None
+        return np.array(emb, dtype=np.float32)
+    except Exception:
+        return None
+
+# =========================
+# CLUSTERING (union-find)
+# =========================
+def semantic_cluster_best(items: list) -> list:
+    if len(items) < 2:
+        return items
+
+    items = items[:400]
+    texts = [f"{it.get('title','')} {clean_text(it.get('full_text',''))[:450]}" for it in items]
+
+    parent = list(range(len(items)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    def time_close(i, j) -> bool:
+        a, b = items[i].get("dt"), items[j].get("dt")
+        if not a or not b:
+            return True
+        if a.tzinfo is None:
+            a = a.replace(tzinfo=timezone.utc)
+        if b.tzinfo is None:
+            b = b.replace(tzinfo=timezone.utc)
+        return abs((a - b).total_seconds()) <= CLUSTER_TIME_WINDOW_HOURS * 3600
+
+    vectors = get_embeddings(texts) if ML_AVAILABLE else None
+    if vectors is not None and len(vectors) == len(items):
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-9
+        V = vectors / norms
+        S = V @ V.T
+
+        n = len(items)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not time_close(i, j):
+                    continue
+                sem = float(S[i, j])
+                if sem >= SEM_SIM_THRESHOLD:
+                    union(i, j)
+                    continue
+
+                ls = sim_title(items[i].get("title", ""), items[j].get("title", ""))
+                off = bool(items[i].get("is_official") or items[j].get("is_official"))
+                if ls >= (LEX_SIM_OFFICIAL_THRESHOLD if off else LEX_SIM_THRESHOLD) and sem >= SEM_SIM_SECONDARY:
+                    union(i, j)
+    else:
+        n = len(items)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not time_close(i, j):
+                    continue
+                ls = sim_title(items[i].get("title", ""), items[j].get("title", ""))
+                off = bool(items[i].get("is_official") or items[j].get("is_official"))
+                if ls >= (LEX_SIM_OFFICIAL_THRESHOLD if off else LEX_SIM_THRESHOLD):
+                    union(i, j)
+
+    clusters: Dict[int, List[dict]] = {}
+    for idx in range(len(items)):
+        clusters.setdefault(find(idx), []).append(items[idx])
+
+    def rank_key(x: dict):
+        return (
+            1 if x.get("is_official") else 0,
+            float(x.get("weight", 0)),
+            1 if x.get("is_deep_read") else 0,
+            len(x.get("full_text", "") or ""),
+        )
+
+    unique = []
+    for group in clusters.values():
+        group.sort(key=rank_key, reverse=True)
+        best = group[0]
+        best["cluster_size"] = len(group)
+        unique.append(best)
+
+    log.info(f"🧩 Clustered: {len(items)} -> {len(unique)} events.")
+    return unique
+
+# =========================
+# SCORING
+# =========================
+CRITICAL_KEYWORDS = {
+    "загинул": 5.0,
+    "загиблих": 5.0,
+    "поранен": 3.0,
+    "жертв": 4.0,
+    "ракета": 4.0,
+    "дрон": 3.0,
+    "обстріл": 3.0,
+    "атака": 3.0,
+    "удар": 3.0,
+    "пошкоджено": 2.5,
+    "зруйновано": 3.0,
+    "критичн": 3.0,
+    "інфраструктур": 3.0,
+}
+IMPORTANT_KEYWORDS = {
+    "схвалено": 4.0,
+    "підписано": 4.0,
+    "санкц": 3.5,
+    "арешт": 3.5,
+    "млрд": 5.0,
+    "мільярд": 5.0,
+    "пакет": 3.0,
+    "допомог": 3.0,
+    "збро": 4.0,
+    "patriot": 5.0,
+    "himars": 5.0,
+    "f-16": 5.0,
+}
+VIP_KEYWORDS = {
+    "нато": 2.5,
+    "білий дім": 2.5,
+    "пентагон": 2.5,
+    "трамп": 2.5,
+    "байден": 2.5,
+    "зеленськ": 2.0,
+}
+EMPTY_TALK = [
+    "стурбован", "обговорили", "планують", "закликав",
+    "висловив", "підкреслив", "зазначив", "наголосив",
+    "експерт", "аналітик", "вважає", "припускає"
+]
+ROUTINE_PHRASES = ["за добу", "за минулу добу", "генштаб", "оперативна інформація", "станом на"]
+
+def calculate_priority_score(item: dict) -> float:
+    score = float(item.get("weight", 0))
+    size = int(item.get("cluster_size", 1))
+    score += math.log(size + 1) * 4.0
+
+    if item.get("is_intl"):
+        score += 6.0
+    if item.get("is_deep_read"):
+        score += 2.0
+    if item.get("is_official"):
+        score += 3.0
+
+    now = datetime.now(timezone.utc)
+    dt = item.get("dt")
+    if dt:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age_h = (now - dt).total_seconds() / 3600
+        score += max(0.0, (1.5 - age_h) * 5.0)
+
+    blob = (item.get("title", "") + " " + item.get("full_text", "")).lower()
+
+    if has_any(blob, FUNDRAISING_WORDS):
+        return -999.0
+
+    for k, b in CRITICAL_KEYWORDS.items():
+        if k in blob:
+            score += b
+    for k, b in IMPORTANT_KEYWORDS.items():
+        if k in blob:
+            score += b
+    for k, b in VIP_KEYWORDS.items():
+        if k in blob:
+            score += b
+
+    if any(p in blob for p in ROUTINE_PHRASES):
+        score -= 8.0
+    if any(p in blob for p in EMPTY_TALK) and float(item.get("weight", 0)) < 8:
+        score -= 6.0
+
+    return score
+
+# =========================
+# DEEP READ
+# =========================
+def deep_read_item(item: dict) -> dict:
+    if item.get("type") != "rss":
+        return item
+    url = item.get("link", "")
+    if not url:
+        return item
+    try:
+        r = SESSION.get(url, timeout=12)
+        if r.status_code != 200 or not r.text:
+            return item
+        extracted = trafilatura.extract(r.text, include_comments=False, include_tables=False)
+        if extracted and len(extracted) > 120:
+            item["full_text"] = extracted[:4500]
+            item["is_deep_read"] = True
+    except Exception:
+        pass
+    return item
+
+def enrich_content_with_deepread(items: list) -> list:
+    if not items:
+        return items
+    log.info(f"🔍 Deep reading top {len(items)} candidates...")
+    out = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = [ex.submit(deep_read_item, it) for it in items]
+        for f in as_completed(futures):
+            out.append(f.result())
+    return out
+
+# =========================
+# AI SELECT + WRITE
+# =========================
+def ai_select_and_write(candidates: list) -> Tuple[List[dict], Optional[str]]:
+    if not candidates:
+        return [], None
+
+    for it in candidates:
+        it["final_score"] = calculate_priority_score(it)
+
+    candidates = [x for x in candidates if x.get("final_score", 0) > 0]
+    candidates.sort(key=lambda x: x["final_score"], reverse=True)
+
+    top = candidates[:DEEP_READ_LIMIT]
+    top = enrich_content_with_deepread(top)
+    pool = top + candidates[DEEP_READ_LIMIT:AI_CONTEXT_LIMIT]
+
+    txt_input = ""
+    now_utc = datetime.now(timezone.utc)
+
+    for i, it in enumerate(pool):
+        limit = 2500 if it.get("is_deep_read") else 700
+        body = clean_text(it.get("full_text", ""))[:limit]
+
+        dt = it.get("dt", now_utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        t_str = dt.strftime("%H:%M")
+
+        src_tag = "[INTL]" if it.get("is_intl") else "[UA]"
+        off_tag = "✅OFFICIAL" if it.get("is_official") else ""
+        deep_tag = "📄FULL" if it.get("is_deep_read") else ""
+        clust = f"×{it.get('cluster_size', 1)}"
+        score = f"{it.get('final_score', 0):.1f}"
+
+        flags = []
+        low = f"{it.get('title','')} {body}".lower()
+        if any(w in low for w in ["загинул", "загиблих", "поранен", "жертв"]):
+            flags.append("⚠️CASUALTIES")
+        if any(w in low for w in ["млрд", "мільярд", "$", "€"]):
+            flags.append("💰MONEY")
+        if any(w in low for w in ROUTINE_PHRASES):
+            flags.append("⚠️ROUTINE?")
+        if any(w in low for w in FUNDRAISING_WORDS):
+            flags.append("⛔FUNDRAISING?")
+        flag_str = " ".join(flags)
+
+        txt_input += (
+            f"═══ ID:{i} ═══\n"
+            f"📊 {src_tag} {off_tag} {deep_tag} | ⏰{t_str} | {clust} | Score:{score}\n"
+            f"📰 SOURCE: {it.get('source','')}\n"
+            f"🔖 {flag_str}\n"
+            f"📌 TITLE: {it.get('title','')}\n"
+            f"📝 BODY:\n{body}\n"
+            f"{'─'*60}\n\n"
+        )
+
+    prompt = SYSTEM_PROMPT.format(NEWS_TARGET=NEWS_TO_PUBLISH, WATCH_TARGET=WATCH_TO_PUBLISH)
+    prompt += f"\n\nCANDIDATES:\n\n{txt_input}"
+
+    try:
+        model = genai.GenerativeModel(
+            GEN_MODEL_NAME,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        resp = model.generate_content(prompt)
+        raw = (resp.text or "").replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw)
+
+        chat_log = data.get("editorial_chat", "")
+        final_posts = []
+
+        for obj in data.get("publish", []) or []:
+            idx = obj.get("id")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(pool):
+                continue
+            orig = pool[idx]
+
+            orig["ai_title"] = obj.get("headline", "") or orig.get("title", "")
+            orig["ai_body"] = obj.get("body", "") or ""
+            orig["ai_category"] = obj.get("category", "ua")
+            orig["ai_verification"] = obj.get("verification_note", "major_media")
+
+            final_posts.append(orig)
+
+        log.info(f"✅ AI selected {len(final_posts)} posts.")
+        return final_posts, chat_log
+
     except Exception as e:
-        st.error(f"⚠️ Помилка виконання: {e}")
+        log.error(f"❌ AI Generation Error: {e}")
+        traceback.print_exc()
+        return [], None
+
+# =========================
+# TELEGRAM PUBLISH
+# =========================
+def tg_send(text: str, disable_preview: bool = True) -> bool:
+    if not text:
+        return True
+    if not TG_BOT_TOKEN:
+        print("--- SIMULATED SEND ---\n" + text)
+        return True
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    ok_all = True
+
+    for chat_id in TARGET_CHATS:
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": bool(disable_preview),
+        }
+
+        sent = False
+        for attempt in range(3):
+            try:
+                r = SESSION.post(url, json=payload, timeout=14)
+                if r.status_code == 200:
+                    sent = True
+                    break
+                if r.status_code == 429:
+                    try:
+                        data = r.json()
+                        wait_s = int(data.get("parameters", {}).get("retry_after", 2))
+                    except Exception:
+                        wait_s = 2
+                    time.sleep(min(wait_s, 10))
+                    continue
+                log.warning(f"TG send failed [{r.status_code}] to {chat_id}: {r.text[:200]}")
+                time.sleep(0.6 + attempt * 0.6)
+            except Exception as ex:
+                log.warning(f"TG send exception to {chat_id}: {ex}")
+                time.sleep(0.6 + attempt * 0.6)
+
+        ok_all = ok_all and sent
+
+    return ok_all
+
+def esc(s: str) -> str:
+    return html.escape(s or "", quote=False)
+
+def format_post_line(it: dict, headlines_only: bool = False) -> str:
+    title = it.get("ai_title") or it.get("title") or ""
+    body = it.get("ai_body") or ""
+    src = it.get("source") or "Джерело"
+    link = it.get("link") or ""
+
+    cat = it.get("ai_category", "ua")
+    icon = "🔹"
+    if cat == "war":
+        icon = "🛡️"
+    elif cat == "intl":
+        icon = "🌍"
+    elif cat == "meme":
+        icon = "🐸"
+
+    # ЛІНК — НА СЛОВІ ДЖЕРЕЛА
+    src_link = f"<a href=\"{link}\"><i>{esc(src)}</i></a>" if link else f"<i>{esc(src)}</i>"
+
+    if headlines_only:
+        return f"{icon} <b>{esc(title)}</b> — {src_link}\n"
+
+    b = esc(body).strip()
+    if b:
+        return f"{icon} <b>{esc(title)}</b>\n{b}\n🔗 {src_link}\n\n"
+    return f"{icon} <b>{esc(title)}</b>\n🔗 {src_link}\n\n"
+
+def publish_and_save(items: list, history: dict) -> int:
+    if not items:
+        return 0
+
+    to_send = []
+    for it in items:
+        if not is_duplicate(it, history):
+            to_send.append(it)
+    if not to_send:
+        return 0
+
+    news_items = [x for x in to_send if x.get("bucket") != "watch"]
+    watch_items = [x for x in to_send if x.get("bucket") == "watch"] if POST_WATCHLIST else []
+
+    casualty_like = []
+    normal_news = []
+
+    for it in news_items:
+        txt = f"{it.get('ai_title','')} {it.get('ai_body','')} {it.get('title','')} {it.get('full_text','')}".lower()
+        if any(w in txt for w in ["загинул", "загиблих", "поранен", "жертв"]) or it.get("ai_category") == "war":
+            if is_attack_like(it.get("ai_title","") or it.get("title",""), it.get("ai_body","") or it.get("full_text","")):
+                casualty_like.append(it)
+            else:
+                normal_news.append(it)
+        else:
+            normal_news.append(it)
+
+    do_casualty_digest = len(casualty_like) >= CASUALTY_DIGEST_THRESHOLD
+
+    ts_title = datetime.now(KYIV_TZ).strftime("%H:%M")
+
+    parts: List[str] = [f"⚡️ <b>Головне на {ts_title}</b>\n\n"]
+    current_len = len(parts[0])
+    part_no = 1
+
+    def flush_new_part():
+        nonlocal parts, current_len, part_no
+        text = "".join(parts).strip()
+        if text:
+            tg_send(text, disable_preview=True)
+        part_no += 1
+        parts = [f"⚡️ <b>Головне на {ts_title} (Частина {part_no})</b>\n\n"]
+        current_len = len(parts[0])
+
+    def add_block(block: str):
+        nonlocal current_len
+        if current_len + len(block) > 3900:
+            flush_new_part()
+        parts.append(block)
+        current_len += len(block)
+
+    for it in normal_news:
+        add_block(format_post_line(it, headlines_only=False))
+
+    if do_casualty_digest:
+        add_block("<b>🛑 Обстріли та жертви: коротко</b>\n")
+        for it in casualty_like:
+            add_block(format_post_line(it, headlines_only=True))
+        add_block("\n")
+    else:
+        for it in casualty_like:
+            add_block(format_post_line(it, headlines_only=False))
+
+    if watch_items:
+        add_block("<b>👀 Watchlist</b>\n\n")
+        for it in watch_items:
+            add_block(format_post_line(it, headlines_only=False))
+
+    final_text = "".join(parts).strip()
+    if final_text:
+        tg_send(final_text, disable_preview=True)
+
+    add_to_history(to_send, history)
+    return len(to_send)
+
+# =========================
+# STATS
+# =========================
+def log_analytics_report(stats: dict, chat_log: Optional[str] = None):
+    report = (
+        f"📊 <b>Stats</b>\n"
+        f"⏱️ {stats.get('duration',0):.1f}s | 📥 {stats.get('raw',0)} | 🧽 {stats.get('after_official',0)}\n"
+        f"🧩 Events: {stats.get('clusters',0)} | ✅ Posted: {stats.get('published',0)}"
+    )
+    log.info(report.replace("\n", " | ").replace("<b>", "").replace("</b>", ""))
+
+    if TG_BOT_TOKEN and TG_ADMIN_ID:
+        try:
+            full = report
+            if chat_log:
+                full += f"\n\n💬 <b>AI Log:</b>\n{esc(str(chat_log)[:3500])}"
+            SESSION.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TG_ADMIN_ID,
+                    "text": full,
+                    "parse_mode": "HTML",
+                    "disable_notification": True
+                },
+                timeout=12
+            )
+        except Exception:
+            pass
+
+# =========================
+# MAIN
+# =========================
+def safe_main():
+    start_time = time.time()
+    stats = {"raw": 0, "after_official": 0, "clusters": 0, "published": 0, "duration": 0}
+
+    if not GOOGLE_API_KEY:
+        print("❌ GOOGLE_API_KEY is missing")
+        sys.exit(1)
+    if not TG_BOT_TOKEN:
+        print("❌ TG_BOT_TOKEN is missing")
+        sys.exit(1)
+    if not TARGET_CHATS:
+        print("❌ TG_CHAT_ID and/or DIGEST_CHANNEL is missing")
+        sys.exit(1)
+
+    genai.configure(api_key=GOOGLE_API_KEY)
+
+    try:
+        cfg = load_sources_cfg()
+        if not cfg:
+            log.error("❌ Sources config empty (news_sources.json or SOURCES_JSON).")
+            return
+
+        history = load_history()
+
+        raw = collect_all(cfg, history)
+        stats["raw"] = len(raw)
+
+        if not raw:
+            log.info("💤 No fresh news found.")
+            return
+
+        raw2 = prefer_official_for_attacks(raw)
+        stats["after_official"] = len(raw2)
+
+        clustered = semantic_cluster_best(raw2)
+        stats["clusters"] = len(clustered)
+
+        final, chat_log = ai_select_and_write(clustered)
+
+        posted = publish_and_save(final, history)
+        stats["published"] = posted
+
+        stats["duration"] = time.time() - start_time
+        log_analytics_report(stats, chat_log)
+
+    except Exception as e:
+        log.critical(f"🔥 FAIL: {e}")
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    safe_main()
